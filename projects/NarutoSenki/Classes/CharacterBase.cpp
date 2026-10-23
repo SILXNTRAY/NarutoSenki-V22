@@ -1,11 +1,303 @@
 #include "CharacterBase.h"
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include "HPBar.h"
 #include "Core/Provider.hpp"
 #include "HudLayer.h"
 #include "GameLayer.h"
+#include "Enums/TowerEnum.h"
 #include "GameMode/GameModeImpl.h"
 #include "MyUtils/CCShake.h"
 #include "Systems/CommandSystem.hpp"
 #include "Utils/Debug/UnitDebug.hpp"
+#include "Data/Fonts.h"
+#include "label_nodes/CCLabelBMFont.h"
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+extern "C" bool MacWsIsConnected();
+extern "C" void MacWsSend(const char *message);
+#elif (CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+extern "C" bool NativeBridgeWsIsConnected(void);
+extern "C" void NativeBridgeWsSend(const char *message);
+#endif
+
+static inline bool nkOnlineWsConnected()
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+	return MacWsIsConnected();
+#else
+	return NativeBridgeWsIsConnected();
+#endif
+}
+
+static inline void nkOnlineWsSend(const char *msg)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+	MacWsSend(msg);
+#else
+	NativeBridgeWsSend(msg);
+#endif
+}
+#endif
+
+namespace
+{
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+extern "C" const char *GetNetworkEnemyHeroName();
+extern "C" bool GetNetworkOpponentIsBot();
+extern "C" const char *GetNetworkYourNickname();
+extern "C" const char *GetNetworkEnemyNickname();
+extern "C" int GetNetworkForcedTeam();
+#endif
+
+/** Online opponent is spawned as Role::Com locally; reuse player tower-blocking so they cannot walk through towers on the watcher client. */
+static bool characterUsesPlayerTowerBlockingWhenWalking(CharacterBase *self)
+{
+	if (!self || self->_isAI || self->_isInvincible || self->_isArmored)
+		return false;
+	if (self->isPlayer())
+		return true;
+	if (!self->isCom())
+		return false;
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	GameLayer *layer = getGameLayer();
+	if (!layer || !layer->_isStarted || !nkOnlineWsConnected())
+		return false;
+	if (GetNetworkOpponentIsBot())
+		return false;
+	if (self->getGroup() == layer->playerGroup)
+		return false;
+	const char *remoteHero = GetNetworkEnemyHeroName();
+	if (!remoteHero || remoteHero[0] == '\0')
+		return false;
+	return self->getName() == remoteHero;
+#else
+	return false;
+#endif
+}
+
+/** True for the mirrored enemy hero in online 1v1 (spawned as Com on the watcher). Walk must follow the owner: cannot cancel NATTACK by movement. */
+static bool isNetworkWsEnemyHeroMirror(CharacterBase *self)
+{
+	if (!self || !self->isCom() || self->isPlayer())
+		return false;
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	GameLayer *layer = getGameLayer();
+	if (!layer || !layer->_isStarted || !nkOnlineWsConnected())
+		return false;
+	if (GetNetworkOpponentIsBot())
+		return false;
+	if (self->getGroup() == layer->playerGroup)
+		return false;
+	const char *remoteHero = GetNetworkEnemyHeroName();
+	if (!remoteHero || remoteHero[0] == '\0')
+		return false;
+	return self->getName() == remoteHero;
+#else
+	return false;
+#endif
+}
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+/** Main enemy hero in online 1v1 (mirrored human or AI bot), same unit id as `GetNetworkEnemyHeroName()`. */
+static bool isNetworkEnemyBattleHero(CharacterBase *self)
+{
+	if (!self || !self->isCom())
+		return false;
+	GameLayer *layer = getGameLayer();
+	if (!layer || GetNetworkForcedTeam() < 0)
+		return false;
+	const char *enemyHero = GetNetworkEnemyHeroName();
+	if (!enemyHero || enemyHero[0] == '\0')
+		return false;
+	if (self->getName() != enemyHero)
+		return false;
+	if (self->getGroup() == layer->playerGroup)
+		return false;
+	return true;
+}
+#endif
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+static bool gameLayerOnlineBattleActive()
+{
+	auto *layer = getGameLayer();
+	return layer && layer->_isStarted && nkOnlineWsConnected();
+}
+#else
+static bool gameLayerOnlineBattleActive()
+{
+	return false;
+}
+#endif
+
+/** Pick vertical slide direction for tower skim; motion-based tie-break improves 1-frame agreement between peers replaying the same inputs. */
+static bool towerWalkChooseVerticalSlideDir(CharacterBase *self, float anchorYpoint, const Vec2 &desiredPos)
+{
+	const Vec2 from = self->getPosition();
+	const Vec2 delta = desiredPos - from;
+	const float ax = fabsf(delta.x);
+	const float ay = fabsf(delta.y);
+	const float idleEpsSq = 1e-8f;
+
+	if (delta.x * delta.x + delta.y * delta.y <= idleEpsSq)
+		return self->getPositionY() > anchorYpoint;
+
+	if (ay > ax + 1e-4f)
+		return delta.y >= 0.0f;
+
+	if (ax > ay + 1e-4f)
+		return (from.y + desiredPos.y) * 0.5f > anchorYpoint;
+
+	// Comparable horizontal/vertical blend: midpoint Y is stabler than from.y alone.
+	return (from.y + desiredPos.y) * 0.5f > anchorYpoint;
+}
+
+static Vec2 pushPointOutsideTowerRect(const Vec2 &p, const CCRect &rect, float margin)
+{
+	if (!rect.containsPoint(CCPointMake(p.x, p.y)))
+		return p;
+
+	const float minX = rect.getMinX();
+	const float maxX = rect.getMaxX();
+	const float minY = rect.getMinY();
+	const float maxY = rect.getMaxY();
+	const float dl = p.x - minX;
+	const float dr = maxX - p.x;
+	const float db = p.y - minY;
+	const float dt = maxY - p.y;
+
+	Vec2 q = p;
+	const float shortest = MIN(dl, MIN(dr, MIN(db, dt)));
+	if (fabsf(shortest - dl) < 1e-4f)
+		q.x = minX - margin;
+	else if (fabsf(shortest - dr) < 1e-4f)
+		q.x = maxX + margin;
+	else if (fabsf(shortest - db) < 1e-4f)
+		q.y = minY - margin;
+	else
+		q.y = maxY + margin;
+	return q;
+}
+
+/** From outside to outside but passing through tower: first outside point before interior; or pull endpoint out if landing inside rect. */
+static Vec2 constrainTowerMoveAgainstRect(const Vec2 &from, const Vec2 &to, const CCRect &rect, float epsAlong)
+{
+	auto insidePt = [&](const Vec2 &p) -> bool {
+		return rect.containsPoint(CCPointMake(p.x, p.y));
+	};
+
+	if (insidePt(from))
+	{
+		const Vec2 pushed = pushPointOutsideTowerRect(from, rect, epsAlong);
+		if ((pushed.x - from.x) * (pushed.x - from.x) + (pushed.y - from.y) * (pushed.y - from.y) < 1e-6f)
+			return to;
+		return constrainTowerMoveAgainstRect(pushed, to, rect, epsAlong);
+	}
+
+	float hiBound = 1.f;
+	if (!insidePt(to))
+	{
+		float firstIn = -1.f;
+		constexpr int coarseSteps = 48;
+		for (int step = 1; step <= coarseSteps; ++step)
+		{
+			const float alpha = float(step) / float(coarseSteps);
+			const Vec2 p(from.x + (to.x - from.x) * alpha, from.y + (to.y - from.y) * alpha);
+			if (insidePt(p))
+			{
+				firstIn = alpha;
+				break;
+			}
+		}
+		if (firstIn < 0.f)
+			return to;
+		hiBound = firstIn;
+	}
+
+	float loSafe = 0.f;
+	float hiUnsafe = hiBound;
+	for (int i = 0; i < 22 && (hiUnsafe - loSafe > 5e-5f); ++i)
+	{
+		const float mid = (loSafe + hiUnsafe) * 0.5f;
+		const Vec2 p(from.x + (to.x - from.x) * mid, from.y + (to.y - from.y) * mid);
+		if (insidePt(p))
+			hiUnsafe = mid;
+		else
+			loSafe = mid;
+	}
+
+	Vec2 hit(from.x + (to.x - from.x) * loSafe, from.y + (to.y - from.y) * loSafe);
+	const float dx = to.x - from.x;
+	const float dy = to.y - from.y;
+	const float len = hypotf(dx, dy);
+	if (len > 1e-5f)
+	{
+		hit.x -= (dx / len) * epsAlong;
+		hit.y -= (dy / len) * epsAlong;
+	}
+	return hit;
+}
+
+static Vec2 onlineResolveTowerWalkDestination(const Vec2 &from, const Vec2 &to, GameLayer *layer)
+{
+	if (!layer)
+		return to;
+	constexpr int kSubsteps = 8;
+	constexpr float kEpsAlong = 2.5f;
+	Vec2 prev = from;
+	const Vec2 delta(to.x - from.x, to.y - from.y);
+	for (int s = 1; s <= kSubsteps; ++s)
+	{
+		Vec2 segEnd(from.x + delta.x * (float(s) / float(kSubsteps)),
+					from.y + delta.y * (float(s) / float(kSubsteps)));
+		for (auto *tower : layer->_TowerArray)
+		{
+			if (!tower)
+				continue;
+			const int metaWidth = 96;
+			const int metaHeight = 128;
+			const int metaX = (int)tower->getPositionX() - metaWidth / 2;
+			const int metaY = (int)tower->getPositionY() - metaHeight / 2;
+			const CCRect rect((float)metaX, (float)(metaY + 32), (float)metaWidth, (float)(metaHeight - 64));
+			segEnd = constrainTowerMoveAgainstRect(prev, segEnd, rect, kEpsAlong);
+		}
+		prev = segEnd;
+	}
+	return prev;
+}
+} // namespace
+
+/** WebSocket sync: authoritative world position after local player takes light knockback (scheduled ~knock slide duration). */
+void CharacterBase::sendOnlineKnockSnapToPeer(float)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	GameLayer *layer = getGameLayer();
+	if (!layer || !layer->_isStarted || layer->_isExiting || !layer->currentMap ||
+		!nkOnlineWsConnected())
+		return;
+	if (!isPlayer())
+		return;
+
+	const Vec2 pos = getPosition();
+	auto *map = layer->currentMap;
+	const float mw = float(map->getMapSize().width * map->getTileSize().width);
+	const float maxY = float(map->getTileSize().height * 5.5f);
+	const float cx = MIN(mw, MAX(0.f, pos.x));
+	const float cy = MIN(maxY, MAX(0.f, pos.y));
+
+	char buf[192];
+	std::snprintf(buf, sizeof(buf),
+				  "{\"type\":\"knock_snap\",\"x\":%.2f,\"y\":%.2f,\"ts\":%ld}",
+				  (double)cx, (double)cy, (long)std::time(nullptr));
+	nkOnlineWsSend(buf);
+#endif
+}
 
 CharacterBase::CharacterBase()
 {
@@ -123,6 +415,7 @@ CharacterBase::CharacterBase()
 	_dehealBuffValue = 0;
 	_powerUPBuffValue = 0;
 	_hpBar = nullptr;
+	_networkNicknameLabel = nullptr;
 
 	_defense = 0;
 	_exp = 0;
@@ -287,6 +580,14 @@ void CharacterBase::update(float dt)
 		_shadow->setPosition(Vec2(getPositionX(), _originY ? _originY : getPositionY()));
 	}
 
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (_networkNicknameLabel && _hpBar)
+	{
+		_networkNicknameLabel->setVisible(_hpBar->isVisible());
+		syncNetworkNicknameLabelLayout();
+	}
+#endif
+
 	if (!_isControlled && _state != State::DEAD)
 	{
 		if (isPlayerOrCom())
@@ -319,35 +620,67 @@ void CharacterBase::update(float dt)
 
 	if (_state == State::WALK)
 	{
-		_desiredPosition = getPosition() + (_velocity * dt);
+		const Vec2 walkStartPos = getPosition();
+		_desiredPosition = walkStartPos + (_velocity * dt);
+		bool shouldSnapTowerClamp = false;
 
-		if (isPlayer() && !_isAI && !_isInvincible && !_isArmored)
+		if (characterUsesPlayerTowerBlockingWhenWalking(this))
 		{
-			// save the stop Area
-			for (auto tower : getGameLayer()->_TowerArray)
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+			const bool useOnlineTowerClamp = gameLayerOnlineBattleActive();
+
+			if (useOnlineTowerClamp)
 			{
-				if (tower)
+				const Vec2 naiveDesired = _desiredPosition;
+				_desiredPosition = onlineResolveTowerWalkDestination(walkStartPos, naiveDesired, getGameLayer());
+
+				const float rdx = _desiredPosition.x - naiveDesired.x;
+				const float rdy = _desiredPosition.y - naiveDesired.y;
+				if (rdx * rdx + rdy * rdy > 4.f)
+					_affectedByTower = true;
+				const float corr2 = rdx * rdx + rdy * rdy;
+				shouldSnapTowerClamp = corr2 > 0.25f;
+				if (dt > 1e-5f && corr2 > 1e-4f)
 				{
-					int metaWidth = 96;
-					int metaHeight = 128;
-					int metaX = tower->getPositionX() - metaWidth / 2;
-					int metaY = tower->getPositionY() - metaHeight / 2;
-					CCRect rect = CCRect(metaX, metaY + 32, metaWidth, metaHeight - 64);
-
-					if (rect.containsPoint(_desiredPosition))
+					const float vx = (_desiredPosition.x - walkStartPos.x) / dt;
+					const float vy = (_desiredPosition.y - walkStartPos.y) / dt;
+					_velocity = Vec2(vx, vy);
+				}
+			}
+			else
+#endif
+			{
+				for (auto tower : getGameLayer()->_TowerArray)
+				{
+					if (tower)
 					{
-						_affectedByTower = true;
+						int metaWidth = 96;
+						int metaHeight = 128;
+						int metaX = tower->getPositionX() - metaWidth / 2;
+						int metaY = tower->getPositionY() - metaHeight / 2;
+						CCRect rect = CCRect(metaX, metaY + 32, metaWidth, metaHeight - 64);
 
-						float anchorYpoint = metaY + metaHeight / 2;
-						if (getPositionY() > anchorYpoint)
+						if (rect.containsPoint(_desiredPosition))
 						{
-							_velocity = Vec2(0, 1 * _walkSpeed * kSpeedBase);
+							_affectedByTower = true;
+
+							const bool networkWalkProxy =
+								characterUsesPlayerTowerBlockingWhenWalking(this) && isCom();
+							float anchorYpoint = metaY + metaHeight / 2;
+							bool slidePositiveY;
+							if (networkWalkProxy ||
+								(gameLayerOnlineBattleActive() && isPlayer()))
+								slidePositiveY =
+									towerWalkChooseVerticalSlideDir(this, anchorYpoint, _desiredPosition);
+							else
+								slidePositiveY = (walkStartPos.y > anchorYpoint);
+
+							if (slidePositiveY)
+								_velocity = Vec2(0, 1 * _walkSpeed * kSpeedBase);
+							else
+								_velocity = Vec2(0, -1 * _walkSpeed * kSpeedBase);
+							_desiredPosition = walkStartPos + (_velocity * dt);
 						}
-						else
-						{
-							_velocity = Vec2(0, -1 * _walkSpeed * kSpeedBase);
-						}
-						_desiredPosition = getPosition() + (_velocity * dt);
 					}
 				}
 			}
@@ -367,6 +700,11 @@ void CharacterBase::update(float dt)
 		float poxY = MIN(getGameLayer()->currentMap->getTileSize().height * 5.5, MAX(0, _desiredPosition.y));
 
 		setPosition(Vec2(posX, poxY));
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+		if (shouldSnapTowerClamp && isPlayer() && getGameLayer())
+			getGameLayer()->sendNetworkOwnedHeroPositionSnapIfNeeded(getPosition(),
+																	 HeroSnapKind::TowerClamp);
+#endif
 		getGameLayer()->reorderChild(this, -getPositionY());
 		if (isPlayerOrCom())
 		{
@@ -387,6 +725,48 @@ void CharacterBase::updateHpBarPosition(float dt)
 		_hpBar->setPositionX(getContentSize().width / 2 - _hpBar->getHPBottom()->getContentSize().width / 2);
 		_hpBar->setPositionY(getHeight());
 	}
+}
+
+void CharacterBase::tryCreateNetworkBattleNicknameLabel()
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (_networkNicknameLabel || !_hpBar)
+		return;
+	if (GetNetworkForcedTeam() < 0)
+		return;
+
+	const char *nickC = nullptr;
+	if (isPlayer())
+		nickC = GetNetworkYourNickname();
+	else if (isNetworkEnemyBattleHero(this))
+		nickC = GetNetworkEnemyNickname();
+	else
+		return;
+
+	if (!nickC || nickC[0] == '\0')
+		return;
+
+	auto *lbl = CCLabelBMFont::create(nickC, Fonts::Default);
+	lbl->setScale(0.24f);
+	lbl->setAnchorPoint(Vec2(0.5f, 0.f));
+	addChild(lbl, 15);
+	_networkNicknameLabel = lbl;
+	syncNetworkNicknameLabelLayout();
+#endif
+}
+
+void CharacterBase::syncNetworkNicknameLabelLayout()
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!_networkNicknameLabel || !_hpBar)
+		return;
+	const float cx = getContentSize().width * 0.5f;
+	const CCRect barBox = _hpBar->boundingBox();
+	const float topY = barBox.getMaxY();
+	const float nickPad = 7.f;
+	_networkNicknameLabel->setAnchorPoint(Vec2(0.5f, 0.f));
+	_networkNicknameLabel->setPosition(Vec2(cx, topY + nickPad));
+#endif
 }
 
 void CharacterBase::acceptAttack(Ref *object)
@@ -624,7 +1004,25 @@ void CharacterBase::acceptAttack(Ref *object)
 							{
 								setKnockLength(32);
 							}
+							if (gameLayerOnlineBattleActive())
+							{
+								// Light knock uses setMove() with _hurtFromLeft/_hurtFromRight only.
+								// Those flags come from sub-pixel range checks and can disagree between
+								// peers; attacker facing matches for the same registered hit.
+								_hurtFromLeft = !attacker->_isFlipped;
+								_hurtFromRight = attacker->_isFlipped;
+							}
 							hurt();
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+							if (gameLayerOnlineBattleActive() && isPlayer() &&
+								_state == State::HURT)
+							{
+								unschedule(schedule_selector(CharacterBase::sendOnlineKnockSnapToPeer));
+								// Knock slide in hurt XML is typically 0.1s — snap after move settles.
+								scheduleOnce(schedule_selector(CharacterBase::sendOnlineKnockSnapToPeer),
+											 0.12f);
+							}
+#endif
 						}
 						else if (hitType == "c_hit" ||
 								 hitType == "bc_hit")
@@ -987,14 +1385,24 @@ FiniteTimeAction *CharacterBase::createAnimation(CCArray *ationArray, uint8_t fp
 			if (key == "f")
 			{
 				auto frame = getSpriteFrame(keyValue);
-				spriteFrames.pushBack(frame);
+				if (frame != nullptr)
+				{
+					spriteFrames.pushBack(frame);
+				}
+				else if (!keyValue.empty())
+				{
+					CCLOGERROR("createAnimation: missing sprite frame '%s' for character '%s'",
+							   keyValue.c_str(), getName().c_str());
+				}
 			}
 			else
 			{
-				tempAnimation = Animation::createWithSpriteFrames(spriteFrames, 1.0f / fps);
-				tempAction = Animate::create(tempAnimation);
-
-				list.pushBack(tempAction);
+				if (!spriteFrames.empty())
+				{
+					tempAnimation = Animation::createWithSpriteFrames(spriteFrames, 1.0f / fps);
+					tempAction = Animate::create(tempAnimation);
+					list.pushBack(tempAction);
+				}
 				if (key == "setAttackBox")
 				{
 					auto call = CallFunc::create(std::bind(&CharacterBase::setAttackBox, this, keyValue));
@@ -1119,9 +1527,12 @@ FiniteTimeAction *CharacterBase::createAnimation(CCArray *ationArray, uint8_t fp
 				}
 				else if (key == "setShadow")
 				{
-					auto frame = spriteFrames.at(spriteFrames.size() - 1);
-					auto call = CallFunc::create(std::bind(&CharacterBase::setShadow, this, frame));
-					list.pushBack(call);
+					if (!spriteFrames.empty())
+					{
+						auto frame = spriteFrames.back();
+						auto call = CallFunc::create(std::bind(&CharacterBase::setShadow, this, frame));
+						list.pushBack(call);
+					}
 				}
 				else if (key == "setTransform")
 				{
@@ -1158,6 +1569,14 @@ FiniteTimeAction *CharacterBase::createAnimation(CCArray *ationArray, uint8_t fp
 
 	if (isLoop)
 	{
+		if (list.empty())
+		{
+			CCLOGERROR("createAnimation: empty loop for character '%s' (check XML vs loaded plists)",
+					   getName().c_str());
+			Vector<FiniteTimeAction *> fallback;
+			fallback.pushBack(DelayTime::create(0.1f));
+			return RepeatForever::create(Sequence::create(fallback));
+		}
 		seq = RepeatForever::create(Sequence::create(list));
 	}
 	else
@@ -1167,7 +1586,12 @@ FiniteTimeAction *CharacterBase::createAnimation(CCArray *ationArray, uint8_t fp
 			auto call = CallFunc::create(std::bind(&CharacterBase::idle, this));
 			list.pushBack(call);
 		}
-
+		if (list.empty())
+		{
+			CCLOGERROR("createAnimation: empty sequence for character '%s' (check XML vs loaded plists)",
+					   getName().c_str());
+			return DelayTime::create(0.01f);
+		}
 		seq = Sequence::create(list);
 	}
 
@@ -1748,7 +2172,7 @@ void CharacterBase::useGear(GearType type)
 
 				_isVisable = false;
 
-				setSound("Audio/Effect/suzou_effect.ogg");
+				setSound("Audio/Effect/suzou_effect.wav");
 				schedule(schedule_selector(CharacterBase::disableGear1), 3.0f);
 			}
 		}
@@ -1789,7 +2213,7 @@ void CharacterBase::useGear(GearType type)
 
 				setSkillEffect("tishen");
 				scheduleOnce(schedule_selector(CharacterBase::disableGear2), 1.0f);
-				setSound("Audio/Effect/poof2.ogg");
+				setSound("Audio/Effect/poof2.wav");
 
 				if (isPlayer() || getGroup() == getGameLayer()->currentPlayer->getGroup())
 					setOpacity(150);
@@ -1899,11 +2323,6 @@ void CharacterBase::setRestore2(float dt)
 
 		if (isZone)
 			setHPValue(getHP() > 1000 ? getHP() - 1000 : 100);
-
-		if (_state == State::IDLE && getHpPercent() < 1)
-		{
-			increaseHpAndUpdateUI(300);
-		}
 	}
 }
 
@@ -3379,7 +3798,7 @@ void CharacterBase::setMonPer(float dt)
 	else if (getName() == HeroEnum::Sai)
 	{
 		monster->setID("Mouse", Role::Mon, _group);
-		setSound("Audio/Sai/ink_mouse.ogg");
+		setSound("Audio/Sai/ink_mouse.wav");
 	}
 
 	monster->setMaster(this);
@@ -3957,7 +4376,8 @@ void CharacterBase::idle()
 
 void CharacterBase::walk(Vec2 direction)
 {
-	if (_state == State::IDLE || _state == State::WALK || (_state == State::NATTACK && isNotPlayer()))
+	if (_state == State::IDLE || _state == State::WALK ||
+		(_state == State::NATTACK && isNotPlayer() && !isNetworkWsEnemyHeroMirror(this)))
 	{
 		isHurtingTower = false;
 
@@ -4366,6 +4786,48 @@ void CharacterBase::knockDown()
 void CharacterBase::dead()
 {
 	getGameModeHandler()->onCharacterDead(this);
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (gameLayerOnlineBattleActive() && !gameLayerIsApplyingPeerSummonDeathFromNetwork() && _master &&
+		(isClone() || isSummon()))
+	{
+		const bool masterIsPlayer = _master->isPlayer();
+		char buf[384];
+		std::snprintf(buf, sizeof(buf),
+					  "{\"type\":\"summon_death\",\"master\":\"%s\",\"unit\":\"%s\",\"master_is_player\":%s,\"ts\":%ld}",
+					  _master->getName().c_str(),
+					  getName().c_str(),
+					  masterIsPlayer ? "true" : "false",
+					  (long)std::time(nullptr));
+		nkOnlineWsSend(buf);
+	}
+	if (gameLayerOnlineBattleActive() && !gameLayerIsApplyingPeerSummonDeathFromNetwork() &&
+		!gameLayerIsApplyingPeerTowerDestroyFromNetwork() && isTower())
+	{
+		GameLayer *layer = getGameLayer();
+		if (layer)
+		{
+			int gdxVal = -1;
+			if (layer->_isHardCoreGame)
+			{
+				const std::string &tn = getName();
+				if (tn == TowerEnum::AkatsukiCenter || tn == TowerEnum::KonohaCenter)
+				{
+					if (layer->_hasSpawnedGuardian && layer->_guardianPickIdx >= 0)
+						gdxVal = layer->_guardianPickIdx;
+					else
+						gdxVal = (getCharId() + layer->mapId) % 2;
+				}
+			}
+			char buf[320];
+			std::snprintf(buf, sizeof(buf),
+						  "{\"type\":\"tower_destroy\",\"charId\":%d,\"mapId\":%d,\"tower\":\"%s\",\"gdx\":%d,\"ts\":%ld}",
+						  getCharId(), layer->mapId, getName().c_str(), gdxVal, (long)std::time(nullptr));
+			nkOnlineWsSend(buf);
+		}
+	}
+#endif
+
 	CCNotificationCenter::sharedNotificationCenter()->removeObserver(this, "acceptAttack");
 
 	_isHitOne = false;
@@ -4471,6 +4933,10 @@ void CharacterBase::dead()
 				auto deadStr = getGameLayer()->getHudLayer()->deadLabel->getString();
 				int deads = to_int(deadStr) + 1;
 				getGameLayer()->getHudLayer()->deadLabel->setString(to_cstr(deads));
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+				if (nkOnlineWsConnected())
+					getGameLayer()->syncOnlineBattleStatsToPeer(true);
+#endif
 			}
 		}
 
@@ -4485,6 +4951,12 @@ void CharacterBase::dead()
 			if (_shadow)
 				_shadow->setVisible(true);
 		}
+	}
+
+	if (_networkNicknameLabel)
+	{
+		_networkNicknameLabel->removeFromParent();
+		_networkNicknameLabel = nullptr;
 	}
 
 	if (_hpBar)
@@ -5238,4 +5710,16 @@ void CharacterBase::updateHpBar()
 {
 	if (_hpBar)
 		_hpBar->loseHP(getHpPercent());
+}
+
+void CharacterBase::applyPeerMirrorHpFromNetwork(uint32_t uhp)
+{
+	setHPValue(uhp, false);
+	if (uhp == 0 && _state != State::DEAD && enableDead)
+	{
+		dead();
+		return;
+	}
+	if (_hpBar)
+		_hpBar->syncVisualPercent(getHpPercent());
 }

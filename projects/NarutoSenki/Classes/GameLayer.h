@@ -4,6 +4,7 @@
 #include "PauseLayer.h"
 #include "Data/UnitData.h"
 #include <memory>
+#include <string>
 
 #if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
 #include "glfw3.h"
@@ -26,6 +27,15 @@
 #include "../../../cocos2dx/platform/android/jni/JniHelper.h"
 #endif
 
+enum class HeroSnapKind : uint8_t
+{
+	TowerClamp,
+	PeriodicCalmWalk,
+	PeriodicSkillCombat,
+	/** One-shot after attack/skill replication—no throttle (drops duplicate coordinates via last-send cache only). */
+	ImmediateBurst,
+};
+
 class BGLayer;
 class CharacterBase;
 class Hero;
@@ -47,6 +57,13 @@ inline GameLayer *getGameLayer()
 {
 	return _gLayer;
 }
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+/** True while applying summon_death from the peer so CharacterBase::dead() does not echo back. */
+bool gameLayerIsApplyingPeerSummonDeathFromNetwork();
+/** True while applying tower_destroy from the peer so CharacterBase::dead() does not echo WS again. */
+bool gameLayerIsApplyingPeerTowerDestroyFromNetwork();
+#endif
 
 class GameLayer : public Layer
 {
@@ -73,6 +90,8 @@ public:
 
 	bool _isAttackButtonRelease;
 	bool _hasSpawnedGuardian;
+	/** Roshi/Han pick from last initGard (for WS tower_destroy / guardian sync). */
+	int _guardianPickIdx;
 	// int _guardianNum;
 	vector<Flog *> _KonohaFlogArray;
 	vector<Flog *> _AkatsukiFlogArray;
@@ -101,8 +120,14 @@ public:
 	void initTileMap();
 	void initHeros();
 	void initFlogs();
+	/** Online follower only: spawn one frog wave when Konoha peer sends flog_wave. */
+	void applyPeerFlogWaveFromNetwork(uint32_t waveSeq);
+	/** Online follower (Akatsuki): apply authoritative frog pose/HP CSV from Konoha (see flog_snap). */
+	void applyPeerFlogSnapFromNetwork(const std::string &dcsv);
 	void initTower();
-	void initGard();
+	/** @param guardianVariant Roshi vs Han: 0 or 1; -1 picks randomly (deterministic when synced online).
+	 * @param anchorTowerName When set (KonohaCenter / AkatsukiCenter), spawn uses world placement for that base — same on both peers (fixes online flip). */
+	void initGard(int guardianVariant = -1, bool notifyNetworkPeers = true, const std::string *anchorTowerName = nullptr);
 	void initEffects();
 
 	void updateViewPoint(float dt);
@@ -125,6 +150,19 @@ public:
 	void onPause();
 	void resumeFromPause();
 	void onGear();
+	/** Pop gear shop scene; used locally and when mirroring remote close in network play. */
+	void dismissGearOverlay();
+	/** Online in-match pause/gear menu: suppress replication so stray touches/keys don't confuse the opponent. */
+	bool shouldBlockNetworkBattleInputEcho() const;
+	/** Broadcast local hero world position—tower edge, calm idle/walk (~4–5 Hz), or skill combat (~13 Hz capped). */
+	void sendNetworkOwnedHeroPositionSnapIfNeeded(const Vec2 &worldPos, HeroSnapKind kind);
+	/** Scheduled ~10 Hz; internal throttling reduces bandwidth while skills are active. */
+	void tickOnlineHeroPositionSnap(float dt);
+	/** Konoha authority: ~10 Hz broadcast frog pose + HP so follower mirrors realtime (no ghost hits). */
+	void tickOnlineFlogSnap(float dt);
+	/** Online: push HP / kill / death stats to peer (throttled unless force). */
+	void syncOnlineBattleStatsToPeer(bool force = false);
+
 	void playGameOpeningAnimation(float dt);
 	void onGameStart(float dt);
 	void onGameOver(bool isWin);
@@ -157,6 +195,7 @@ public:
 	Group playerGroup;
 	bool _isStarted;
 	bool _isExiting;
+	bool _hasGameOverTriggered;
 
 	const char *getGuardianGroup()
 	{
@@ -166,6 +205,11 @@ public:
 	bool _isGear;
 	bool _isPause;
 	GearLayer *_gearLayer;
+	PauseLayer *_pauseLayer;
+	/** Local/offline: gear UI uses pushScene; online Mac overlay uses addChild on running scene. */
+	bool _gearOpenedWithPushScene;
+	/** Same distinction as gear for pause menu. */
+	bool _pauseOpenedWithPushScene;
 
 	void clearAllFlogsMainTarget(CharacterBase *target);
 	void clearAllUnitsMainTarget(CharacterBase *target);
@@ -198,6 +242,8 @@ private:
 
 	void invokeAllCallbacks();
 
+	void spawnFlogWave(uint32_t waveSeq);
+
 	inline Vec2 getCustomSpawnPoint(HeroData &data);
 
 	bool isHUDInitialized = false;
@@ -207,6 +253,9 @@ private:
 	std::unique_ptr<BattleRuntimeSystem> _battleRuntimeSystem;
 	std::unique_ptr<SpawnSystem> _spawnSystem;
 	std::unique_ptr<SessionState> _sessionState;
+
+	/** Increments each spawned frog wave (offline + online); tags frogs for network CSV sync. */
+	uint32_t _flogWaveSeqCounter = 0;
 };
 
 #define BIND(funcName) std::bind(&funcName, this)

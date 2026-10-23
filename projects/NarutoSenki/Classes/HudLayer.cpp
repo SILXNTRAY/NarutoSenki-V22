@@ -1,7 +1,27 @@
 #include "Core/Hero.hpp"
 #include "GameLayer.h"
 #include "HudLayer.h"
+#include "Utils/Cocos2dxHelper.hpp"
 #include "MyUtils/CCShake.h"
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+extern "C" bool MacWsIsConnected();
+#elif (CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+extern "C" bool NativeBridgeWsIsConnected(void);
+#endif
+extern "C" int GetNetworkForcedTeam();
+void NetLatencyPingSend();
+
+static inline bool hudOnlineWsConnected()
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+	return MacWsIsConnected();
+#else
+	return NativeBridgeWsIsConnected();
+#endif
+}
+#endif
 
 MiniIcon::MiniIcon()
 {
@@ -126,6 +146,7 @@ HudLayer::HudLayer()
 
 	bcdLabel1 = nullptr;
 	bcdLabel2 = nullptr;
+	pingLabel = nullptr;
 }
 
 void HudLayer::onEnter()
@@ -139,6 +160,7 @@ void HudLayer::onEnter()
 
 void HudLayer::onExit()
 {
+	unschedule(schedule_selector(HudLayer::tickOnlinePingLatency));
 	Layer::onExit();
 	if (getGameLayer()->_isExiting)
 	{
@@ -253,6 +275,23 @@ void HudLayer::initHeroInterface()
 	pauseNenu->setPosition(Vec2(winWidth, winHeight));
 	addChild(pauseNenu);
 
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	// Match config is set before LoadLayer; WS may report connected slightly later on Android (JNI),
+	// so key off network session, not only hudOnlineWsConnected() at init time.
+	if (GetNetworkForcedTeam() != -1 || hudOnlineWsConnected())
+	{
+		const float mmw = menu_button->getContentSize().width;
+		pingLabel = CCLabelBMFont::create("-- ms", Fonts::Default);
+		pingLabel->setScale(0.22f);
+		pingLabel->setAnchorPoint(Vec2(1.f, 1.f));
+		// Beside minimap_bg icon (pause/minimap button), not the tactical miniLayer.
+		pingLabel->setPosition(Vec2(winWidth - mmw - 8.f, winHeight - 6.f));
+		addChild(pingLabel, 5002);
+		tickOnlinePingLatency(0.f);
+		schedule(schedule_selector(HudLayer::tickOnlinePingLatency), 2.0f);
+	}
+#endif
+
 	Sprite *killIcon = Sprite::createWithSpriteFrameName("kill_icon.png");
 	killIcon->setAnchorPoint(Vec2(0, 1));
 	killIcon->setPosition(Vec2(winWidth - 114, winHeight - 46));
@@ -329,7 +368,7 @@ void HudLayer::initHeroInterface()
 	gameClock->setPosition(Vec2(mScaleX * 25, 0));
 	addChild(gameClock, 5000);
 
-	coinLabel = CCLabelBMFont::create(currentPlayer->getCoin_Value().asString().c_str(), Fonts::Arial);
+	coinLabel = CCLabelBMFont::create(formatCoinForDisplay(static_cast<int>(currentPlayer->getCoin())).c_str(), Fonts::Arial);
 	coinLabel->setAnchorPoint(Vec2(0, 0));
 	coinLabel->setPosition(Vec2(121, winHeight - 61));
 
@@ -533,6 +572,7 @@ void HudLayer::initHeroInterface()
 	}
 
 	addChild(miniLayer, 500);
+
 	// Call after all addChild functions
 	// thats can make ActionButton::setLock -> setMask work
 	updateSpecialSkillButtons();
@@ -555,6 +595,24 @@ void HudLayer::addMapIcon()
 			mi->setCharId(player->getCharId());
 		}
 	}
+}
+
+void HudLayer::setOnlinePingMs(int ms)
+{
+	if (!pingLabel)
+		return;
+	pingLabel->setString(format("{} ms", ms).c_str());
+}
+
+void HudLayer::tickOnlinePingLatency(float dt)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	(void)dt;
+	if (hudOnlineWsConnected())
+		NetLatencyPingSend();
+#else
+	(void)dt;
+#endif
 }
 
 void HudLayer::updateGears()
@@ -720,26 +778,31 @@ void HudLayer::setTowerState(int charId)
 
 void HudLayer::setCoin(const char *value)
 {
-	auto cl = coinLabel->getString();
-	int tempCoin = to_int(cl) + to_int(value);
-	coinLabel->setString(to_cstr(tempCoin));
+	auto *player = getGameLayer()->currentPlayer;
+	if (!coinLabel || !player)
+	{
+		return;
+	}
+	const int next = static_cast<int>(player->getCoin()) + to_int(value);
+	coinLabel->setString(formatCoinForDisplay(next).c_str());
 }
 
 bool HudLayer::offCoin(const char *value)
 {
-	auto cl = coinLabel->getString();
-	int tempCoin = to_int(cl);
-	if (tempCoin - to_int(value) >= 0)
-	{
-		tempCoin -= to_int(value);
-		coinLabel->setString(to_cstr(tempCoin));
-		getGameLayer()->currentPlayer->minusCoin(to_uint(value));
-		return true;
-	}
-	else
+	auto *player = getGameLayer()->currentPlayer;
+	if (!coinLabel || !player)
 	{
 		return false;
 	}
+	const int sub = to_int(value);
+	const int tempCoin = static_cast<int>(player->getCoin());
+	if (tempCoin - sub >= 0)
+	{
+		player->minusCoin(static_cast<uint32_t>(sub));
+		coinLabel->setString(formatCoinForDisplay(static_cast<int>(player->getCoin())).c_str());
+		return true;
+	}
+	return false;
 }
 
 void HudLayer::setReport(const string &slayer, const string &dead, uint32_t killNum)
@@ -1001,25 +1064,25 @@ Sprite *HudLayer::createSPCReport(uint32_t killNum, int num)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("DoubleKill_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_1.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_1.wav");
 		}
 		else if (killNum < 20)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("KillingSpree_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_2.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_2.wav");
 		}
 		else if (killNum < 30)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("Unstoppable_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_3.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_3.wav");
 		}
 		else
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("Godlike_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_4.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill2_4.wav");
 		}
 	}
 	else if (num == 2)
@@ -1028,32 +1091,32 @@ Sprite *HudLayer::createSPCReport(uint32_t killNum, int num)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("TripeKill_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_1.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_1.wav");
 		}
 		else if (killNum < 20)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("Domination_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_2.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_2.wav");
 		}
 		else if (killNum < 30)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("Rampage_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_3.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_3.wav");
 		}
 		else if (killNum >= 30)
 		{
 			reportSPCSprite = Sprite::createWithSpriteFrameName("Holyshit_rpf.png");
 			if (isBrocast)
-				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_4.ogg");
+				SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill3_4.wav");
 		}
 	}
 	else
 	{
 		reportSPCSprite = Sprite::createWithSpriteFrameName("MonsterKill_rpf.png");
 		if (isBrocast)
-			SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill4.ogg");
+			SimpleAudioEngine::sharedEngine()->playEffect("Audio/Menu/kill4.wav");
 	}
 
 	return reportSPCSprite;

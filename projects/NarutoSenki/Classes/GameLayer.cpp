@@ -1,5 +1,11 @@
 #include "Defines.h"
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <sstream>
 #include "CharacterBase.h"
+#include "Core/Warrior/Flog.hpp"
+#include "Data/Config.h"
 #include "GameLayer.h"
 #include "BGLayer.h"
 #include "HudLayer.h"
@@ -10,9 +16,161 @@
 #include "Systems/BattleRuntimeSystem.hpp"
 #include "Systems/SpawnSystem.hpp"
 #include "Systems/SessionState.hpp"
+#include "Enums/TowerEnum.h"
+
+// GameLayer.cpp
+// - Owns core battle lifecycle and gameplay flow.
+// - Delegates network input details to GameLayerNetworkInput.inl.
+// - Delegates local input/key handling to GameLayerInputControl.inl.
 
 GameLayer *_gLayer = nullptr;
 bool _isFullScreen = false;
+
+namespace
+{
+static Flog *findFlogByNetworkSlot(GameLayer *layer, uint32_t wave, unsigned slot)
+{
+	if (!layer || slot >= (unsigned)(2 * kFlogCount))
+		return nullptr;
+	for (auto *p : layer->_KonohaFlogArray)
+	{
+		if (p && p->_netWaveSeq == wave && (unsigned)p->_netSlot == slot)
+			return p;
+	}
+	for (auto *p : layer->_AkatsukiFlogArray)
+	{
+		if (p && p->_netWaveSeq == wave && (unsigned)p->_netSlot == slot)
+			return p;
+	}
+	return nullptr;
+}
+}
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+extern "C" bool MacWsIsConnected();
+extern "C" void MacWsSend(const char *message);
+#elif (CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+extern "C" bool NativeBridgeWsIsConnected(void);
+extern "C" void NativeBridgeWsSend(const char *message);
+#endif
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+extern "C" int GetNetworkForcedTeam();
+
+static inline bool GamePlatformWsConnected()
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+	return MacWsIsConnected();
+#else
+	return NativeBridgeWsIsConnected();
+#endif
+}
+
+static inline void GamePlatformWsSend(const char *msg)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
+	MacWsSend(msg);
+#else
+	NativeBridgeWsSend(msg);
+#endif
+}
+#endif
+
+#include "GameLayerNetworkInput.inl"
+
+extern "C" bool GetNetworkOpponentIsBot();
+
+bool GameLayer::shouldBlockNetworkBattleInputEcho() const
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	return _isStarted && GamePlatformWsConnected() && (_isPause || _isGear);
+#else
+	return false;
+#endif
+}
+
+void GameLayer::sendNetworkOwnedHeroPositionSnapIfNeeded(const Vec2 &worldPos, HeroSnapKind kind)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!GamePlatformWsConnected() || !_isStarted || _isExiting)
+		return;
+	using namespace std::chrono;
+	static steady_clock::time_point s_lastSentAt = steady_clock::now();
+	static Vec2 s_lastSentPos(0, 0);
+	static bool s_haveLastSentPos = false;
+	const auto now = steady_clock::now();
+	const auto msSince = duration_cast<milliseconds>(now - s_lastSentAt).count();
+	const float ddx = worldPos.x - s_lastSentPos.x;
+	const float ddy = worldPos.y - s_lastSentPos.y;
+	const float drift2 = ddx * ddx + ddy * ddy;
+
+	int minIntervalMs = 250;
+	float minQuietDrift2 = 100.f;
+	if (kind == HeroSnapKind::TowerClamp)
+	{
+		minIntervalMs = 50;
+		minQuietDrift2 = 400.f;
+	}
+	else if (kind == HeroSnapKind::PeriodicCalmWalk)
+	{
+		minIntervalMs = 90;
+		minQuietDrift2 = 49.f; // ~7 px
+	}
+	else if (kind == HeroSnapKind::PeriodicSkillCombat)
+	{
+		// Dash / skill timelines diverge fastest—send more often and on smaller deltas.
+		minIntervalMs = 72;
+		minQuietDrift2 = 144.f; // ~12 px
+	}
+	else if (kind == HeroSnapKind::ImmediateBurst)
+	{
+		minIntervalMs = 0;
+		minQuietDrift2 = 0.f;
+	}
+	else
+	{
+		minIntervalMs = 220;
+		minQuietDrift2 = 100.f; // ~10 px
+	}
+
+	if (kind != HeroSnapKind::ImmediateBurst)
+	{
+		if (msSince < minIntervalMs && drift2 < minQuietDrift2 && s_haveLastSentPos)
+			return;
+	}
+	else if (drift2 < 0.01f && s_haveLastSentPos && msSince < 16)
+	{
+		return;
+	}
+
+	char heroSnapBuf[192];
+	std::snprintf(heroSnapBuf, sizeof(heroSnapBuf),
+				  "{\"type\":\"hero_snap\",\"x\":%.2f,\"y\":%.2f,\"ts\":%ld}",
+				  (double)worldPos.x, (double)worldPos.y, (long)time(nullptr));
+	GamePlatformWsSend(heroSnapBuf);
+	s_lastSentPos = worldPos;
+	s_haveLastSentPos = true;
+	s_lastSentAt = now;
+#else
+	(void)worldPos;
+	(void)kind;
+#endif
+}
+
+void GameLayer::tickOnlineHeroPositionSnap(float)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!_isStarted || _isExiting || !GamePlatformWsConnected() || !currentPlayer ||
+		currentPlayer->getState() == State::DEAD)
+		return;
+	const State st = currentPlayer->getState();
+	const bool calm = (st == State::IDLE || st == State::WALK);
+	sendNetworkOwnedHeroPositionSnapIfNeeded(currentPlayer->getPosition(),
+											 calm ? HeroSnapKind::PeriodicCalmWalk
+												  : HeroSnapKind::PeriodicSkillCombat);
+	syncOnlineBattleStatsToPeer(false);
+#endif
+}
 
 void BattleRuntimeSystem::onGameStart(GameLayer *layer, bool skipInitFlogs, float flogSpawnDuration) const
 {
@@ -26,18 +184,52 @@ void BattleRuntimeSystem::onGameStart(GameLayer *layer, bool skipInitFlogs, floa
 	layer->schedule(schedule_selector(GameLayer::checkBackgroundMusic), 2.0f);
 	if (!skipInitFlogs)
 	{
-		layer->schedule(schedule_selector(GameLayer::addFlog), flogSpawnDuration);
 		layer->initFlogs();
-		layer->addFlog(0);
+		layer->_flogWaveSeqCounter = 0;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+		const bool onlineWs = GamePlatformWsConnected();
+		const bool flogAuthority = !onlineWs || GetNetworkForcedTeam() == 0;
+#else
+		const bool flogAuthority = true;
+#endif
+		if (flogAuthority)
+		{
+			layer->schedule(schedule_selector(GameLayer::addFlog), flogSpawnDuration);
+			layer->addFlog(0);
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+			if (onlineWs && GetNetworkForcedTeam() == 0)
+				layer->schedule(schedule_selector(GameLayer::tickOnlineFlogSnap), 0.1f);
+#endif
+		}
 	}
 
 	layer->setKeyEventHandler();
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected())
+	{
+		layer->schedule(schedule_selector(GameLayer::tickOnlineHeroPositionSnap), 1.f / 30.f);
+	}
+#endif
 	for (auto hero : layer->_CharacterArray)
 	{
 		hero->setWalkSpeed(hero->_originSpeed);
 		if (hero->isCom())
+		{
+			const char *remoteHeroName = GetNetworkEnemyHeroName();
+			if (!GetNetworkOpponentIsBot() && remoteHeroName && strlen(remoteHeroName) > 0 &&
+				hero->getName() == remoteHeroName)
+			{
+				hero->unschedule(schedule_selector(CharacterBase::setAI));
+				hero->_isAI = false;
+				continue;
+			}
 			hero->doAI();
+		}
 	}
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected())
+		layer->syncOnlineBattleStatsToPeer(true);
+#endif
 }
 
 void BattleRuntimeSystem::updateGameTime(GameLayer *layer) const
@@ -107,9 +299,11 @@ GameLayer::GameLayer()
 	_isShacking = false;
 	_isSurrender = false;
 	_hasSpawnedGuardian = false;
+	_guardianPickIdx = -1;
 
 	_isStarted = false;
 	_isExiting = false;
+	_hasGameOverTriggered = false;
 
 	ougisChar = nullptr;
 	controlChar = nullptr;
@@ -123,6 +317,10 @@ GameLayer::GameLayer()
 
 	_isGear = false;
 	_isPause = false;
+	_gearLayer = nullptr;
+	_pauseLayer = nullptr;
+	_gearOpenedWithPushScene = false;
+	_pauseOpenedWithPushScene = false;
 
 #if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
 	_lastPressedMovementKey = -100;
@@ -173,6 +371,9 @@ void GameLayer::onEnter()
 	}
 
 	Layer::onEnter();
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	resetNetworkInputStateOnEnter();
+#endif
 
 	if (_isSurrender)
 	{
@@ -183,6 +384,9 @@ void GameLayer::onEnter()
 void GameLayer::onExit()
 {
 	Layer::onExit();
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	resetNetworkInputStateOnExit();
+#endif
 
 	if (_isExiting)
 	{
@@ -209,29 +413,68 @@ void GameLayer::initTileMap()
 		CCMessageBox("Not found any map", "[Error] Not found any map");
 		return;
 	}
-	mapId = random(mapCount) + 1;
+	int forcedMapId = 0;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	forcedMapId = GetNetworkForcedMapId();
+#endif
+	if (forcedMapId > 0 && forcedMapId <= mapCount)
+		mapId = forcedMapId;
+	else
+		mapId = random(mapCount) + 1;
 	currentMap = TMXTiledMap::create(GetMapPath(mapId));
 	addChild(currentMap, kMapOrder);
 }
 
-void GameLayer::initGard()
+void GameLayer::initGard(int guardianVariant, bool notifyNetworkPeers, const std::string *anchorTowerName)
 {
-	setRand();
-	int index = random(2);
-	auto guardianName = index == 0 ? GuardianEnum::Roshi : GuardianEnum::Han;
-	auto guardianGroup = playerGroup == Group::Konoha ? Group::Akatsuki : Group::Konoha;
-	auto guardian = Provider::create(guardianName, Role::Com, guardianGroup);
+	if (_hasSpawnedGuardian)
+		return;
 
-	if (playerGroup == Group::Konoha)
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	/** Hardcore guardians (Roshi/Han) are disabled for WS matches — avoids sync issues and keeps lanes simpler. */
+	if (GamePlatformWsConnected())
+		return;
+#endif
+
+	setRand();
+	const int index = (guardianVariant >= 0) ? (guardianVariant % 2) : random(2);
+	auto guardianName = index == 0 ? GuardianEnum::Roshi : GuardianEnum::Han;
+
+	Group guardianGroup = Group::Konoha;
+	Vec2 spawnPos(272, 80);
+
+	if (anchorTowerName && !anchorTowerName->empty())
 	{
-		guardian->setPosition(Vec2(2800, 80));
-		guardian->setSpawnPoint(Vec2(2800, 80));
+		if (*anchorTowerName == TowerEnum::AkatsukiCenter)
+		{
+			guardianGroup = Group::Akatsuki;
+			spawnPos = Vec2(2800, 80);
+		}
+		else if (*anchorTowerName == TowerEnum::KonohaCenter)
+		{
+			guardianGroup = Group::Konoha;
+			spawnPos = Vec2(272, 80);
+		}
+		else
+		{
+			return;
+		}
 	}
 	else
 	{
-		guardian->setPosition(Vec2(272, 80));
-		guardian->setSpawnPoint(Vec2(272, 80));
+		guardianGroup = playerGroup == Group::Konoha ? Group::Akatsuki : Group::Konoha;
+		if (playerGroup == Group::Konoha)
+			spawnPos = Vec2(2800, 80);
+		else
+			spawnPos = Vec2(272, 80);
 	}
+
+	_guardianPickIdx = index;
+
+	auto guardian = Provider::create(guardianName, Role::Com, guardianGroup);
+
+	guardian->setPosition(spawnPos);
+	guardian->setSpawnPoint(spawnPos);
 
 	addChild(guardian, -guardian->getPositionY());
 	guardian->setLV(6);
@@ -248,6 +491,21 @@ void GameLayer::initGard()
 	_hudLayer->addMapIcon();
 
 	_hasSpawnedGuardian = true;
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (notifyNetworkPeers && GamePlatformWsConnected())
+	{
+		char buf[224];
+		if (anchorTowerName && !anchorTowerName->empty())
+			snprintf(buf, sizeof(buf), "{\"type\":\"guardian_spawn\",\"idx\":%d,\"tower\":\"%s\"}", index,
+					 anchorTowerName->c_str());
+		else
+			snprintf(buf, sizeof(buf), "{\"type\":\"guardian_spawn\",\"idx\":%d}", index);
+		GamePlatformWsSend(buf);
+	}
+#else
+	(void)notifyNetworkPeers;
+#endif
 }
 
 void GameLayer::initHeros()
@@ -290,21 +548,23 @@ void GameLayer::initHeros()
 	}
 
 	int i = 0;
+	int konohaSpawnIndex = 0;
+	int akatsukiSpawnIndex = 0;
 	for (auto &data : herosDataVector)
 	{
 		if (data.isInit)
 			continue;
 
-		int mapPos = i;
+		int mapPos = 0;
 		if (data.group == Group::Akatsuki)
 		{
-			if (mapPos <= MapPosCount - 1)
-				mapPos += MapPosCount;
+			mapPos = MapPosCount + (akatsukiSpawnIndex % MapPosCount);
+			akatsukiSpawnIndex++;
 		}
 		else
 		{
-			if (mapPos > MapPosCount - 1)
-				mapPos -= MapPosCount;
+			mapPos = (konohaSpawnIndex % MapPosCount);
+			konohaSpawnIndex++;
 		}
 
 		Ref *mapObject = objectArray->objectAtIndex(mapPos);
@@ -374,7 +634,7 @@ void GameLayer::playGameOpeningAnimation(float dt)
 	getHudLayer()->playGameOpeningAnimation();
 
 	setRand();
-	auto path = random(2) == 0 ? "Audio/Menu/battle_start1.ogg" : "Audio/Menu/battle_start.ogg";
+	auto path = random(2) == 0 ? "Audio/Menu/battle_start1.wav" : "Audio/Menu/battle_start.wav";
 	SimpleAudioEngine::sharedEngine()->playEffect(path);
 
 	scheduleOnce(schedule_selector(GameLayer::onGameStart), 0.75f);
@@ -396,7 +656,7 @@ void GameLayer::initFlogs()
 	aName = FlogEnum::FemalePainFlog;
 }
 
-void GameLayer::addFlog(float dt)
+void GameLayer::spawnFlogWave(uint32_t waveSeq)
 {
 	auto KonohaFlogName = kName;
 	auto AkatsukiFlogName = aName;
@@ -408,6 +668,8 @@ void GameLayer::addFlog(float dt)
 	{
 		flog = Flog::create();
 		flog->setID(KonohaFlogName, Role::Flog, Group::Konoha);
+		flog->_netWaveSeq = waveSeq;
+		flog->_netSlot = (uint8_t)i;
 		if (i < kFlogCount / 2)
 			mainPosY = (5.5 - i / 1.5) * 32;
 		else
@@ -425,6 +687,8 @@ void GameLayer::addFlog(float dt)
 	{
 		flog = Flog::create();
 		flog->setID(AkatsukiFlogName, Role::Flog, Group::Akatsuki);
+		flog->_netWaveSeq = waveSeq;
+		flog->_netSlot = (uint8_t)(kFlogCount + i);
 		if (i < kFlogCount / 2)
 			mainPosY = (5.5 - i / 1.5) * 32;
 		else
@@ -437,6 +701,132 @@ void GameLayer::addFlog(float dt)
 		_AkatsukiFlogArray.push_back(flog);
 		addChild(flog, -flog->getPositionY());
 	}
+}
+
+void GameLayer::applyPeerFlogWaveFromNetwork(uint32_t waveSeq)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!GamePlatformWsConnected() || GetNetworkForcedTeam() == 0)
+		return;
+#endif
+	spawnFlogWave(waveSeq);
+}
+
+void GameLayer::applyPeerFlogSnapFromNetwork(const std::string &dcsv)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!GamePlatformWsConnected() || GetNetworkForcedTeam() == 0 || !_isStarted || _isExiting)
+		return;
+#endif
+	std::stringstream ss(dcsv);
+	std::string rec;
+	while (std::getline(ss, rec, '|'))
+	{
+		if (rec.empty())
+			continue;
+		unsigned w = 0;
+		unsigned s = 0;
+		unsigned hp = 0;
+		unsigned st = 0;
+		unsigned flip = 0;
+		float x = 0.f;
+		float y = 0.f;
+		int parsed =
+			std::sscanf(rec.c_str(), "%u,%u,%f,%f,%u,%u,%u", &w, &s, &x, &y, &hp, &st, &flip);
+		if (parsed != 7)
+		{
+			parsed = std::sscanf(rec.c_str(), "%u,%u,%f,%f,%u,%u", &w, &s, &x, &y, &hp, &st);
+			if (parsed != 6)
+				continue;
+			flip = 0;
+		}
+		Flog *flog = findFlogByNetworkSlot(this, (uint32_t)w, s);
+		if (!flog)
+			continue;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+		if (GamePlatformWsConnected() && GetNetworkForcedTeam() != 0)
+		{
+			const Vec2 tgt(x, y);
+			flog->_followNetTargetPos = tgt;
+			flog->_followNetSmoothActive = (hp > 0);
+			const float dx = tgt.x - flog->getPositionX();
+			const float dy = tgt.y - flog->getPositionY();
+			if (dx * dx + dy * dy > 360000.f)
+				flog->setPosition(tgt);
+			reorderChild(flog, -(int)flog->getPositionY());
+		}
+		else
+#endif
+		{
+			flog->setPosition(Vec2(x, y));
+			reorderChild(flog, -(int)flog->getPositionY());
+		}
+		flog->setHPValue((uint32_t)hp, false);
+		if (flog->_hpBar)
+			flog->_hpBar->syncVisualPercent(flog->getHpPercent());
+		if (hp == 0 && flog->getState() != State::DEAD)
+			flog->dead();
+		else if (hp > 0)
+			flog->syncFollowerMirrorVisual((State)st, flip != 0);
+	}
+}
+
+void GameLayer::tickOnlineFlogSnap(float)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (!GamePlatformWsConnected() || GetNetworkForcedTeam() != 0 || !_isStarted || _isExiting || !currentMap)
+		return;
+	std::string d;
+	d.reserve(4096);
+	for (auto *f : _KonohaFlogArray)
+	{
+		if (!f)
+			continue;
+		char chunk[128];
+		std::snprintf(chunk, sizeof(chunk), "%u,%u,%.2f,%.2f,%u,%u,%u|", (unsigned)f->_netWaveSeq, (unsigned)f->_netSlot,
+					  f->getPositionX(), f->getPositionY(), (unsigned)f->getHP(), (unsigned)f->getState(),
+					  f->_isFlipped ? 1u : 0u);
+		d += chunk;
+	}
+	for (auto *f : _AkatsukiFlogArray)
+	{
+		if (!f)
+			continue;
+		char chunk[128];
+		std::snprintf(chunk, sizeof(chunk), "%u,%u,%.2f,%.2f,%u,%u,%u|", (unsigned)f->_netWaveSeq, (unsigned)f->_netSlot,
+					  f->getPositionX(), f->getPositionY(), (unsigned)f->getHP(), (unsigned)f->getState(),
+					  f->_isFlipped ? 1u : 0u);
+		d += chunk;
+	}
+	if (!d.empty())
+		d.pop_back();
+	if (d.empty())
+		return;
+	std::string json = "{\"type\":\"flog_snap\",\"d\":\"";
+	json += d;
+	json += "\"}";
+	GamePlatformWsSend(json.c_str());
+#endif
+}
+
+void GameLayer::addFlog(float dt)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected() && GetNetworkForcedTeam() != 0)
+		return;
+#endif
+	const uint32_t waveSeq = _flogWaveSeqCounter++;
+	spawnFlogWave(waveSeq);
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected() && GetNetworkForcedTeam() == 0)
+	{
+		char buf[160];
+		std::snprintf(buf, sizeof(buf),
+					  "{\"type\":\"flog_wave\",\"seq\":%u,\"ts\":%ld}",
+					  waveSeq, (long)std::time(nullptr));
+		GamePlatformWsSend(buf);
+	}
+#endif
 }
 
 void GameLayer::initTower()
@@ -523,6 +913,9 @@ void GameLayer::updateGameTime(float dt)
 
 void GameLayer::updateViewPoint(float dt)
 {
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	processRemoteInputQueue(this);
+#endif
 	_battleRuntimeSystem->updateViewPoint(this);
 }
 
@@ -539,6 +932,54 @@ void GameLayer::updateHudSkillButtons()
 void GameLayer::setHPLose(float percent)
 {
 	_hudLayer->setHPLose(percent);
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected())
+		syncOnlineBattleStatsToPeer(false);
+#endif
+}
+
+void GameLayer::syncOnlineBattleStatsToPeer(bool force)
+{
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	static std::chrono::steady_clock::time_point s_lastBattleStatSent{};
+	static bool s_didSendBattleStat = false;
+	static constexpr int kBattleStatMinIntervalMs = 180;
+
+	if (!GamePlatformWsConnected() || !_isStarted || _isExiting || !currentPlayer)
+		return;
+
+	const auto now = std::chrono::steady_clock::now();
+	if (!force && s_didSendBattleStat)
+	{
+		const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastBattleStatSent).count();
+		if (dt < kBattleStatMinIntervalMs)
+			return;
+	}
+	s_didSendBattleStat = true;
+	s_lastBattleStatSent = now;
+
+	const uint32_t hp = currentPlayer->getHP();
+	const uint32_t maxHp = currentPlayer->getMaxHP();
+	const uint32_t kills = currentPlayer->getKillNum();
+	const uint32_t deaths = currentPlayer->_deadNum;
+	const uint32_t flog = currentPlayer->_flogNum;
+	int kono = 0;
+	int aka = 0;
+	if (_hudLayer && _hudLayer->KonoLabel && _hudLayer->AkaLabel)
+	{
+		kono = to_int(_hudLayer->KonoLabel->getString());
+		aka = to_int(_hudLayer->AkaLabel->getString());
+	}
+
+	char buf[360];
+	std::snprintf(buf, sizeof(buf),
+				  "{\"type\":\"battle_stat\",\"hp\":%u,\"maxHp\":%u,\"kills\":%u,\"deaths\":%u,\"flog\":%u,"
+				  "\"kono\":%d,\"aka\":%d,\"ts\":%ld}",
+				  hp, maxHp, kills, deaths, flog, kono, aka, (long)std::time(nullptr));
+	GamePlatformWsSend(buf);
+#else
+	(void)force;
+#endif
 }
 
 void GameLayer::setCKRLose(bool isCRK2)
@@ -667,70 +1108,55 @@ void GameLayer::clearDoubleClick()
 	}
 }
 
-void GameLayer::JoyStickRelease()
-{
-	if (currentPlayer->getState() == State::WALK)
-	{
-		currentPlayer->idle();
-	}
-}
-
-void GameLayer::JoyStickUpdate(Vec2 direction)
-{
-	if (!ougisChar)
-	{
-		// CCLOG("x:%f,y:%f",direction.x,direction.y);
-		currentPlayer->walk(direction);
-	}
-}
-
-void GameLayer::attackButtonClick(ABType type)
-{
-	if (type == NAttack)
-	{
-		_isAttackButtonRelease = false;
-	}
-
-	if (type == Item1)
-	{
-		currentPlayer->setItem(type);
-	}
-	else
-	{
-		currentPlayer->attack(type);
-	}
-}
-
-void GameLayer::gearButtonClick(GearType type)
-{
-	currentPlayer->useGear(type);
-}
-
-void GameLayer::attackButtonRelease()
-{
-	_isAttackButtonRelease = true;
-}
-
 void GameLayer::onPause()
 {
 	if (_isPause)
 		return;
 
+	sendNetworkMatchUIIfActive("pause", true);
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (_isStarted && GamePlatformWsConnected())
+	{
+		sendNetworkJoyReleaseEvent();
+		if (currentPlayer && currentPlayer->getState() == State::WALK)
+			currentPlayer->idle();
+	}
+#endif
+
 	_isPause = true;
-	RenderTexture *snapshoot = RenderTexture::create(winSize.width, winSize.height);
+	bool isNetworkOverlay = false;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	isNetworkOverlay = _isStarted && GamePlatformWsConnected();
+#endif
 	Scene *f = Director::sharedDirector()->getRunningScene();
-	Ref *pObject = f->getChildren()->objectAtIndex(0);
-	BGLayer *bg = (BGLayer *)pObject;
-	snapshoot->begin();
-	bg->visit();
+	RenderTexture *snapshoot = nullptr;
+	if (!isNetworkOverlay)
+	{
+		snapshoot = RenderTexture::create(winSize.width, winSize.height);
+		Ref *pObject = f->getChildren()->objectAtIndex(0);
+		BGLayer *bg = (BGLayer *)pObject;
+		snapshoot->begin();
+		bg->visit();
 
-	visit();
-	snapshoot->end();
+		visit();
+		snapshoot->end();
+	}
 
-	Scene *pscene = Scene::create();
-	PauseLayer *layer = PauseLayer::create(snapshoot);
-	pscene->addChild(layer);
-	Director::sharedDirector()->pushScene(pscene);
+	PauseLayer *layer = PauseLayer::create(snapshoot, isNetworkOverlay);
+	_pauseLayer = layer;
+	if (isNetworkOverlay)
+	{
+		f->addChild(layer, 5000);
+		_pauseOpenedWithPushScene = false;
+	}
+	else
+	{
+		Scene *pscene = Scene::create();
+		pscene->addChild(layer);
+		Director::sharedDirector()->pushScene(pscene);
+		_pauseOpenedWithPushScene = true;
+	}
 }
 
 void GameLayer::resumeFromPause()
@@ -738,17 +1164,39 @@ void GameLayer::resumeFromPause()
 	if (!_isPause)
 		return;
 
-	if (UserDefault::sharedUserDefault()->getBoolForKey("isBGM"))
+	if (_pauseOpenedWithPushScene)
 	{
-		SimpleAudioEngine::sharedEngine()->resumeBackgroundMusic();
+		if (UserDefault::sharedUserDefault()->getBoolForKey("isBGM"))
+		{
+			SimpleAudioEngine::sharedEngine()->resumeBackgroundMusic();
+		}
+		if (UserDefault::sharedUserDefault()->getBoolForKey("isVoice"))
+		{
+			SimpleAudioEngine::sharedEngine()->resumeAllEffects();
+		}
+		_pauseLayer = nullptr;
+		Director::sharedDirector()->popScene();
+		_pauseOpenedWithPushScene = false;
 	}
-	if (UserDefault::sharedUserDefault()->getBoolForKey("isVoice"))
+	else if (_pauseLayer && _pauseLayer->getParent())
 	{
-		SimpleAudioEngine::sharedEngine()->resumeAllEffects();
+		_pauseLayer->removeFromParent();
+		_pauseLayer = nullptr;
 	}
-
-	Director::sharedDirector()->popScene();
+	else
+	{
+		if (UserDefault::sharedUserDefault()->getBoolForKey("isBGM"))
+		{
+			SimpleAudioEngine::sharedEngine()->resumeBackgroundMusic();
+		}
+		if (UserDefault::sharedUserDefault()->getBoolForKey("isVoice"))
+		{
+			SimpleAudioEngine::sharedEngine()->resumeAllEffects();
+		}
+		Director::sharedDirector()->popScene();
+	}
 	_isPause = false;
+	sendNetworkMatchUIIfActive("pause", false);
 }
 
 void GameLayer::onGear()
@@ -757,39 +1205,117 @@ void GameLayer::onGear()
 		return;
 	if (_isGear)
 		return;
+
+	sendNetworkMatchUIIfActive("gear", true);
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (_isStarted && GamePlatformWsConnected())
+	{
+		sendNetworkJoyReleaseEvent();
+		if (currentPlayer && currentPlayer->getState() == State::WALK)
+			currentPlayer->idle();
+	}
+#endif
+
 	_isGear = true;
+	bool isNetworkOverlay = false;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	isNetworkOverlay = _isStarted && GamePlatformWsConnected();
+#endif
 
-	RenderTexture *snapshoot = RenderTexture::create(winSize.width, winSize.height);
 	Scene *f = Director::sharedDirector()->getRunningScene();
-	Ref *pObject = f->getChildren()->objectAtIndex(0);
-	BGLayer *bg = (BGLayer *)pObject;
-	snapshoot->begin();
-	bg->visit();
+	RenderTexture *snapshoot = nullptr;
+	if (!isNetworkOverlay)
+	{
+		snapshoot = RenderTexture::create(winSize.width, winSize.height);
+		Ref *pObject = f->getChildren()->objectAtIndex(0);
+		BGLayer *bg = (BGLayer *)pObject;
+		snapshoot->begin();
+		bg->visit();
 
-	visit();
-	snapshoot->end();
+		visit();
+		snapshoot->end();
+	}
 
-	Scene *pscene = Scene::create();
-	GearLayer *layer = GearLayer::create(snapshoot);
+	GearLayer *layer = GearLayer::create(snapshoot, isNetworkOverlay);
 	_gearLayer = layer;
 	layer->updatePlayerGear();
-	pscene->addChild(layer);
-	Director::sharedDirector()->pushScene(pscene);
+	if (isNetworkOverlay)
+	{
+		f->addChild(layer, 5000);
+		_gearOpenedWithPushScene = false;
+	}
+	else
+	{
+		Scene *pscene = Scene::create();
+		pscene->addChild(layer);
+		Director::sharedDirector()->pushScene(pscene);
+		_gearOpenedWithPushScene = true;
+	}
+}
+
+void GameLayer::dismissGearOverlay()
+{
+	if (!_isGear)
+		return;
+	if (_hudLayer)
+	{
+		_hudLayer->updateGears();
+	}
+	if (_gearOpenedWithPushScene)
+	{
+		_gearLayer = nullptr;
+		Director::sharedDirector()->popScene();
+		_gearOpenedWithPushScene = false;
+	}
+	else if (_gearLayer && _gearLayer->getParent())
+	{
+		_gearLayer->removeFromParent();
+		_gearLayer = nullptr;
+	}
+	else
+	{
+		Director::sharedDirector()->popScene();
+	}
+	_isGear = false;
+	sendNetworkMatchUIIfActive("gear", false);
 }
 
 void GameLayer::onGameOver(bool isWin)
 {
+	if (_hasGameOverTriggered)
+		return;
+
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	if (GamePlatformWsConnected())
+		syncOnlineBattleStatsToPeer(true);
+#endif
+
+	_hasGameOverTriggered = true;
+	_isStarted = false;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	unschedule(schedule_selector(GameLayer::tickOnlineHeroPositionSnap));
+	unschedule(schedule_selector(GameLayer::tickOnlineFlogSnap));
+#endif
+
+	bool isApplyingRemoteMatchEnd = false;
+#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC || CC_TARGET_PLATFORM == CC_PLATFORM_ANDROID)
+	isApplyingRemoteMatchEnd = s_isApplyingRemoteMatchEnd;
+#endif
+	if (!isApplyingRemoteMatchEnd)
+	{
+		sendNetworkMatchEnd(isWin, _isSurrender ? "surrender" : "game_over");
+	}
+
 	removeKeyEventHandler();
 
 	if (_isPause)
 	{
-		_isPause = false;
-		Director::sharedDirector()->popScene();
+		resumeFromPause();
 	}
 	if (_isGear)
 	{
-		_isGear = false;
-		Director::sharedDirector()->popScene();
+		dismissGearOverlay();
 	}
 
 	RenderTexture *snapshoot = RenderTexture::create(winSize.width, winSize.height);
@@ -865,17 +1391,17 @@ void GameLayer::checkBackgroundMusic(float dt)
 				int id = (mapId - 1) > 4 ? 4 : (mapId - 1);
 				if (_playNum == 0)
 				{
-					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.ogg", 2 + id * 3).c_str(), false);
+					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.m4a", 2 + id * 3).c_str(), false);
 					_playNum++;
 				}
 				else if (_playNum == 1)
 				{
-					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.ogg", 3 + id * 3).c_str(), false);
+					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.m4a", 3 + id * 3).c_str(), false);
 					_playNum++;
 				}
 				else if (_playNum == 2)
 				{
-					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.ogg", 1 + id * 3).c_str(), false);
+					SimpleAudioEngine::sharedEngine()->playBackgroundMusic(format("Audio/Music/Battle{}.m4a", 1 + id * 3).c_str(), false);
 					_playNum = 0;
 				}
 			}
@@ -907,7 +1433,7 @@ void GameLayer::setOugis(CharacterBase *sender)
 
 		if (UserDefault::sharedUserDefault()->getBoolForKey("isVoice"))
 		{
-			SimpleAudioEngine::sharedEngine()->playEffect(format("Audio/Ougis/{}_ougis.ogg", ougisChar->getName()).c_str());
+			SimpleAudioEngine::sharedEngine()->playEffect(format("Audio/Ougis/{}_ougis.wav", ougisChar->getName()).c_str());
 		}
 
 		_hudLayer->setOugis(ougisChar->getName(), ougisChar->getGroup());
@@ -930,32 +1456,8 @@ void GameLayer::removeOugis()
 	ougisChar = nullptr;
 }
 
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
-extern "C" void MacKeyboard_register();
-extern "C" void MacKeyboard_unregister();
-#endif
-
-void GameLayer::setKeyEventHandler()
-{
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
-	Director::sharedDirector()->getOpenGLView()->setAccelerometerKeyHook((GLView::LPFN_ACCELEROMETER_KEYHOOK)(&GameLayer::LPFN_ACCELEROMETER_KEYHOOK));
-#elif (CC_TARGET_PLATFORM == CC_PLATFORM_LINUX)
-	glfwSetKeyCallback(_window, keyEventHandle);
-#elif (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
-	MacKeyboard_register();
-#endif
-}
-
-void GameLayer::removeKeyEventHandler()
-{
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
-	Director::sharedDirector()->getOpenGLView()->setAccelerometerKeyHook(nullptr);
-#elif (CC_TARGET_PLATFORM == CC_PLATFORM_LINUX)
-	glfwSetKeyCallback(_window, nullptr);
-#elif (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
-	MacKeyboard_unregister();
-#endif
-}
+// Input/key control split out for readability.
+#include "GameLayerInputControl.inl"
 
 int GameLayer::getMapCount()
 {
@@ -997,437 +1499,3 @@ void GameLayer::clearAllUnitsMainTarget(CharacterBase *target)
 	UnitEx::clearMainTarget(target, _AkatsukiFlogArray);
 }
 
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32 || CC_TARGET_PLATFORM == CC_PLATFORM_LINUX)
-
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
-#define isPressed(__KEY__) _isPressed(__KEY__)
-#elif (CC_TARGET_PLATFORM == CC_PLATFORM_LINUX)
-#if __has_include("glfw3.h")
-#include "glfw3.h"
-#elif __has_include(<GLFW/glfw3.h>)
-#include <GLFW/glfw3.h>
-#elif __has_include("glfw3/include/mac/glfw3.h")
-#include "glfw3/include/mac/glfw3.h"
-#else
-#error "GLFW header not found. Check include paths."
-#endif
-#define isPressed(__KEY__) glfwGetKey(_window, __KEY__)
-#endif
-
-/**
- * Use __W __S __D __A control when to force move
- */
-#define MOVE(__W, __S, __D, __A, name, keyState)                                    \
-	{                                                                               \
-		if (keyState)                                                               \
-			_gLayer->_lastPressedMovementKey = name;                                \
-		else if (_gLayer->_lastPressedMovementKey == name)                          \
-			_gLayer->_lastPressedMovementKey = -100;                                \
-		int horizontal;                                                             \
-		int vertical;                                                               \
-		if (__W)                                                                    \
-		{                                                                           \
-			vertical = (isPressed(KEY_W) ? 1 : -1);                                 \
-		}                                                                           \
-		else if (__S)                                                               \
-		{                                                                           \
-			vertical = (isPressed(KEY_S) ? -1 : 1);                                 \
-		}                                                                           \
-		else                                                                        \
-		{                                                                           \
-			vertical = (isPressed(KEY_W) ? 1 : -1) + (isPressed(KEY_S) ? -1 : 1);   \
-			vertical = abs(vertical) > 1 ? vertical / 2 : vertical;                 \
-		}                                                                           \
-		if (__D)                                                                    \
-		{                                                                           \
-			horizontal = (isPressed(KEY_D) ? 1 : -1);                               \
-		}                                                                           \
-		else if (__A)                                                               \
-		{                                                                           \
-			horizontal = (isPressed(KEY_A) ? -1 : 1);                               \
-		}                                                                           \
-		else                                                                        \
-		{                                                                           \
-			horizontal = (isPressed(KEY_D) ? 1 : -1) + (isPressed(KEY_A) ? -1 : 1); \
-			horizontal = abs(horizontal) > 1 ? horizontal / 2 : horizontal;         \
-		}                                                                           \
-		if (horizontal != 0 || vertical != 0)                                       \
-		{                                                                           \
-			if (!_gLayer->ougisChar)                                                \
-				_gLayer->currentPlayer->walk(Vec2(horizontal, vertical));           \
-		}                                                                           \
-		else if (_gLayer->currentPlayer->getState() == State::WALK)                 \
-		{                                                                           \
-			_gLayer->_lastPressedMovementKey = -100;                                \
-			_gLayer->currentPlayer->idle();                                         \
-		}                                                                           \
-		break;                                                                      \
-	}
-
-#define ON_GEAR_BY(__ID__, __KEY_STATE__)                                     \
-	if (_gLayer->_isGear && __KEY_STATE__)                                    \
-	{                                                                         \
-		auto &gearBtns = _gLayer->_gearLayer->_screwLayer->getGearBtnArray(); \
-		if (gearBtns.size() >= __ID__ - 1)                                    \
-		{                                                                     \
-			auto gear_btn = gearBtns.at(__ID__ - 1);                          \
-			if (gear_btn)                                                     \
-				gear_btn->click();                                            \
-		}                                                                     \
-	}                                                                         \
-	break;
-
-bool GameLayer::checkHasAnyMovement()
-{
-	if (_gLayer)
-	{
-		if (_gLayer->_lastPressedMovementKey != -100)
-		{
-			keyEventHandle(_window, _gLayer->_lastPressedMovementKey, 0, 1, 0);
-			return true;
-		}
-	}
-	return false;
-}
-
-/** NOTE: Impl key listener */
-void GameLayer::keyEventHandle(GLFWwindow *window, int key, int scancode, int keyState, int mods)
-{
-	// NOTE: only attack button can hold
-	//  Other keys is only click
-	if (keyState == 2 && key != KEY_J)
-		return;
-	switch (key)
-	{
-	case KEY_W:
-		// case KEY_UP:
-		MOVE(keyState, 0, 0, 0, KEY_W, keyState);
-	case KEY_S:
-		// case KEY_DOWN:
-		MOVE(0, keyState, 0, 0, KEY_S, keyState);
-	case KEY_A:
-		// case KEY_LEFT:
-		MOVE(0, 0, keyState, 0, KEY_A, keyState);
-	case KEY_D:
-		// case KEY_RIGHT:
-		MOVE(0, 0, 0, keyState, KEY_D, keyState);
-	case KEY_J:
-		if (keyState)
-			_gLayer->_hudLayer->nAttackButton->click();
-		else
-			_gLayer->_isAttackButtonRelease = true;
-		break;
-	case KEY_L: // Ramen button
-		if (keyState)
-			_gLayer->_hudLayer->item1Button->click();
-		break;
-	case KEY_H: // Ougis 2 buttons
-		if (keyState)
-			_gLayer->_hudLayer->skill5Button->click();
-		break;
-	case KEY_K: // Ougis 1 buttons
-		if (keyState)
-			_gLayer->_hudLayer->skill4Button->click();
-		break;
-	case KEY_U: // skill 1
-		if (keyState)
-			_gLayer->_hudLayer->skill1Button->click();
-		break;
-	case KEY_I: // skill 2
-		if (keyState)
-			_gLayer->_hudLayer->skill2Button->click();
-		break;
-	case KEY_O: // skill 3
-		if (keyState)
-			_gLayer->_hudLayer->skill3Button->click();
-		break;
-		// Gear buttons
-	case KEY_1:
-	case KEY_KP_1:
-		ON_GEAR_BY(1, keyState);
-	case KEY_2:
-	case KEY_KP_2:
-		ON_GEAR_BY(2, keyState);
-	case KEY_3:
-	case KEY_KP_3:
-		ON_GEAR_BY(3, keyState);
-	case KEY_4:
-	case KEY_KP_4:
-		ON_GEAR_BY(4, keyState);
-	case KEY_5:
-	case KEY_KP_5:
-		ON_GEAR_BY(5, keyState);
-	case KEY_6:
-	case KEY_KP_6:
-		ON_GEAR_BY(6, keyState);
-	case KEY_7:
-	case KEY_KP_7:
-		ON_GEAR_BY(7, keyState);
-	case KEY_8:
-	case KEY_KP_8:
-		ON_GEAR_BY(8, keyState);
-	case KEY_9:
-	case KEY_KP_9:
-		ON_GEAR_BY(9, keyState);
-	case KEY_0:
-	case KEY_KP_0:
-		break;
-	/* Item buttons */
-	// Item 1 & Purchase
-	case KEY_B:
-		if (keyState)
-		{
-			if (_gLayer->_isGear)
-				_gLayer->_gearLayer->confirmPurchase();
-			else
-				_gLayer->_hudLayer->getItem3Button()->click();
-		}
-		break;
-	// Item 2
-	case KEY_N:
-		if (keyState)
-			_gLayer->_hudLayer->getItem4Button()->click();
-		break;
-	// Item 3
-	case KEY_M:
-		if (keyState)
-			_gLayer->_hudLayer->getItem2Button()->click();
-		break;
-	case KEY_ESCAPE:
-	case KEY_ENTER:
-		if (keyState && _gLayer->_isStarted == true)
-		{
-			if (_gLayer->_isPause)
-			{
-				_gLayer->resumeFromPause();
-			}
-			else if (_gLayer->_isGear)
-			{
-				Director::sharedDirector()->popScene();
-				_gLayer->_isGear = false;
-			}
-			else
-			{
-				_gLayer->onPause(); // enter pause menu
-			}
-		}
-		break;
-	case KEY_SPACE:
-		if (_gLayer->_enableGear && _gLayer->_isStarted && keyState && !_gLayer->_isPause)
-		{
-			if (_gLayer->_isGear)
-			{
-				Director::sharedDirector()->popScene();
-				_gLayer->_isGear = false;
-			}
-			else
-			{
-				_gLayer->onGear(); // enter gear shop
-			}
-		}
-		break;
-	case KEY_F11:
-		// if (keyState)
-		// {
-		// 	// SET_FULL_SCREEN_MODE(_window, _isFullScreen);
-		// 	GLFWmonitor *monitor = glfwGetPrimaryMonitor();
-		// 	if (nullptr == monitor)
-		// 	{
-		// 		return;
-		// 	}
-		// 	const GLFWvidmode *videoMode = glfwGetVideoMode(monitor);
-		// 	int width, height;
-		// 	glfwGetWindowSize(_window, &width, &height);
-		// 	if (_isFullScreen)
-		// 	{
-		// 		glfwSetWindowMonitor(_window, nullptr, videoMode->width / 2, videoMode->height / 2, WIDTH, HEIGHT, videoMode->refreshRate);
-		// 		glfwSetWindowPos(_window,
-		// 						 (videoMode->width - WIDTH) / 2,
-		// 						 (videoMode->height - HEIGHT) * 0.35f);
-		// 	}
-		// 	else
-		// 	{
-		// 		glfwSetWindowMonitor(_window, nullptr, 0, 0, videoMode->width, videoMode->height, videoMode->refreshRate);
-		// 		Director::sharedDirector()->getOpenGLView()->updateFrameSize(videoMode->width,videoMode->height);
-		// 	}
-		// 	_isFullScreen = !_isFullScreen;
-		// }
-		break;
-	}
-}
-
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_WIN32)
-
-void GameLayer::LPFN_ACCELEROMETER_KEYHOOK(UINT message, WPARAM wParam, LPARAM lParam)
-{
-	switch (message)
-	{
-	case WM_SYSKEYDOWN:
-	case WM_KEYDOWN:
-		keyEventHandle(nullptr, wParam, 0, 1, 0);
-		break;
-	case WM_SYSKEYUP:
-	case WM_KEYUP:
-		keyEventHandle(nullptr, wParam, 0, 0, 0);
-		break;
-	}
-}
-
-#endif
-
-#endif
-
-#if (CC_TARGET_PLATFORM == CC_PLATFORM_MAC)
-
-static bool s_macKeyState[256] = {};
-
-#define isPressed(__KEY__) ((__KEY__) < 256 && s_macKeyState[__KEY__])
-
-#define MOVE_MAC(__W, __S, __D, __A, name, keyState)                                    \
-	{                                                                               \
-		if (keyState)                                                               \
-			_gLayer->_lastPressedMovementKey = name;                                \
-		else if (_gLayer->_lastPressedMovementKey == name)                          \
-			_gLayer->_lastPressedMovementKey = -100;                                \
-		int horizontal;                                                             \
-		int vertical;                                                               \
-		if (__W)                                                                    \
-		{                                                                           \
-			vertical = (isPressed(KEY_W) ? 1 : -1);                                \
-		}                                                                           \
-		else if (__S)                                                               \
-		{                                                                           \
-			vertical = (isPressed(KEY_S) ? -1 : 1);                                \
-		}                                                                           \
-		else                                                                        \
-		{                                                                           \
-			vertical = (isPressed(KEY_W) ? 1 : -1) + (isPressed(KEY_S) ? -1 : 1);  \
-			vertical = abs(vertical) > 1 ? vertical / 2 : vertical;                \
-		}                                                                           \
-		if (__D)                                                                    \
-		{                                                                           \
-			horizontal = (isPressed(KEY_D) ? 1 : -1);                              \
-		}                                                                           \
-		else if (__A)                                                               \
-		{                                                                           \
-			horizontal = (isPressed(KEY_A) ? -1 : 1);                              \
-		}                                                                           \
-		else                                                                        \
-		{                                                                           \
-			horizontal = (isPressed(KEY_D) ? 1 : -1) + (isPressed(KEY_A) ? -1 : 1); \
-			horizontal = abs(horizontal) > 1 ? horizontal / 2 : horizontal;        \
-		}                                                                           \
-		if (horizontal != 0 || vertical != 0)                                       \
-		{                                                                           \
-			if (!_gLayer->ougisChar)                                                \
-				_gLayer->currentPlayer->walk(Vec2(horizontal, vertical));           \
-		}                                                                           \
-		else if (_gLayer->currentPlayer->getState() == State::WALK)                 \
-		{                                                                           \
-			_gLayer->_lastPressedMovementKey = -100;                                \
-			_gLayer->currentPlayer->idle();                                         \
-		}                                                                           \
-		break;                                                                      \
-	}
-
-void GameLayer::keyEventHandle(int key, int keyState)
-{
-	if (!_gLayer || !_gLayer->currentPlayer)
-		return;
-
-	if (key >= 0 && key < 256)
-		s_macKeyState[key] = (keyState != 0);
-
-	switch (key)
-	{
-	case KEY_W:
-		MOVE_MAC(keyState, 0, 0, 0, KEY_W, keyState);
-	case KEY_S:
-		MOVE_MAC(0, keyState, 0, 0, KEY_S, keyState);
-	case KEY_A:
-		MOVE_MAC(0, 0, keyState, 0, KEY_A, keyState);
-	case KEY_D:
-		MOVE_MAC(0, 0, 0, keyState, KEY_D, keyState);
-	case KEY_J:
-		if (keyState)
-			_gLayer->_hudLayer->nAttackButton->click();
-		else
-			_gLayer->_isAttackButtonRelease = true;
-		break;
-	case KEY_L:
-		if (keyState)
-			_gLayer->_hudLayer->item1Button->click();
-		break;
-	case KEY_H:
-		if (keyState)
-			_gLayer->_hudLayer->skill5Button->click();
-		break;
-	case KEY_K:
-		if (keyState)
-			_gLayer->_hudLayer->skill4Button->click();
-		break;
-	case KEY_U:
-		if (keyState)
-			_gLayer->_hudLayer->skill1Button->click();
-		break;
-	case KEY_I:
-		if (keyState)
-			_gLayer->_hudLayer->skill2Button->click();
-		break;
-	case KEY_O:
-		if (keyState)
-			_gLayer->_hudLayer->skill3Button->click();
-		break;
-	case KEY_1: case KEY_KP_1:
-		if (_gLayer->_isGear && keyState) { auto &gb = _gLayer->_gearLayer->_screwLayer->getGearBtnArray(); if (gb.size()>=1 && gb.at(0)) gb.at(0)->click(); } break;
-	case KEY_2: case KEY_KP_2:
-		if (_gLayer->_isGear && keyState) { auto &gb = _gLayer->_gearLayer->_screwLayer->getGearBtnArray(); if (gb.size()>=2 && gb.at(1)) gb.at(1)->click(); } break;
-	case KEY_3: case KEY_KP_3:
-		if (_gLayer->_isGear && keyState) { auto &gb = _gLayer->_gearLayer->_screwLayer->getGearBtnArray(); if (gb.size()>=3 && gb.at(2)) gb.at(2)->click(); } break;
-	case KEY_B:
-		if (keyState) { if (_gLayer->_isGear) _gLayer->_gearLayer->confirmPurchase(); else _gLayer->_hudLayer->getItem3Button()->click(); } break;
-	case KEY_N:
-		if (keyState) _gLayer->_hudLayer->getItem4Button()->click(); break;
-	case KEY_M:
-		if (keyState) _gLayer->_hudLayer->getItem2Button()->click(); break;
-	case KEY_SPACE:
-		if (_gLayer->_enableGear && _gLayer->_isStarted && keyState && !_gLayer->_isPause)
-		{
-			if (_gLayer->_isGear)
-			{
-				Director::sharedDirector()->popScene();
-				_gLayer->_isGear = false;
-			}
-			else
-			{
-				_gLayer->onGear();
-			}
-		}
-		break;
-	case KEY_ESCAPE: case KEY_ENTER:
-		if (keyState && _gLayer->_isStarted)
-		{
-			if (_gLayer->_isPause) { _gLayer->resumeFromPause(); }
-			else if (_gLayer->_isGear) { Director::sharedDirector()->popScene(); _gLayer->_isGear = false; }
-			else { _gLayer->onPause(); }
-		}
-		break;
-	}
-}
-
-bool GameLayer::checkHasAnyMovement()
-{
-	if (_gLayer && _gLayer->_lastPressedMovementKey != -100)
-	{
-		keyEventHandle(_gLayer->_lastPressedMovementKey, 1);
-		return true;
-	}
-	return false;
-}
-
-#elif !(CC_TARGET_PLATFORM == CC_PLATFORM_WIN32 || CC_TARGET_PLATFORM == CC_PLATFORM_LINUX)
-bool GameLayer::checkHasAnyMovement()
-{
-	return false;
-}
-#endif

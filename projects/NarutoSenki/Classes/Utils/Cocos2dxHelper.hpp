@@ -8,7 +8,7 @@
 #else
 #define FMT_HEADER_ONLY
 #define FMT_CONSTEVAL
-#include "fmt/core.h"
+#include "../../../../external/fmt/core.h"
 
 using namespace fmt;
 #endif
@@ -21,6 +21,20 @@ using namespace std;
 
 #define to_uint(str) strtoul(str, nullptr, 10)
 #define to_int(str) atoi(str)
+
+/** HUD coin: below 10000 show full amount; from 10000 show whole thousands + K (e.g. 10000 -> 10K). */
+static inline string formatCoinForDisplay(int amount)
+{
+	if (amount < 0)
+	{
+		amount = 0;
+	}
+	if (amount < 10000)
+	{
+		return to_string(amount);
+	}
+	return to_string(amount / 1000) + "K";
+}
 
 #define RETURN_FALSE_IF(var) \
 	if (var)                 \

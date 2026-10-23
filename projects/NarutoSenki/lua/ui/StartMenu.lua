@@ -3,6 +3,20 @@
 --
 ns.StartMenu = StartMenu
 
+--- Hapus state match online + konfigurasi native (tanpa ganti scene).
+--- Dipanggil saat kembali ke menu, game over, atau buka select offline (training, dll.).
+function clearStaleNetworkSessionForMenu()
+    if wsIsConnected() then
+        wsSend('{"type":"queue_leave"}')
+        wsDisconnect()
+    end
+    _G.__networkLobbyLayer = nil
+    _G.__networkSelectLayer = nil
+    _G.__networkMatchId = nil
+    _G.__networkVsBot = nil
+    wsClearMatchConfig()
+end
+
 function StartMenu:init()
     log('Initial StartMenu...')
 
@@ -67,7 +81,8 @@ function StartMenu:init()
     -- self:addChild(startmenu_title, 3)
 end
 
-function enterSelectLayer(gameMode, enableCustomSelect)
+--- @param fromNetworkMatchFlow boolean|nil Jika true, dipanggil dari lobby setelah match_found (jangan reset state WS/match).
+function enterSelectLayer(gameMode, enableCustomSelect, fromNetworkMatchFlow)
     tools.addSprites('Select.plist')
     tools.addSprites('UI.plist')
     tools.addSprites('Report.plist')
@@ -76,8 +91,13 @@ function enterSelectLayer(gameMode, enableCustomSelect)
     tools.addSprites('Map.plist')
     tools.addSprites('Gears.plist')
 
+    if fromNetworkMatchFlow ~= true then
+        clearStaleNetworkSessionForMenu()
+    end
+
     _G.mode = gameMode
     _G.enableCustomSelect = enableCustomSelect
+    _G.__networkSelectLayer = nil
     local selectScene = CCScene:create()
     local selectLayer = SelectLayer:create()
 
@@ -88,10 +108,33 @@ function enterSelectLayer(gameMode, enableCustomSelect)
 end
 
 function onGameOver()
+    clearStaleNetworkSessionForMenu()
     local menuScene = CCScene:create()
     local menuLayer = StartMenu:create()
 
     hook.registerInitHandlerOnly(menuLayer)
     menuScene:addChild(menuLayer)
     director.replaceSceneWithFade(menuScene, 1.25)
+end
+
+function onWebSocketEvent(eventName, payload)
+    local lobby = _G.__networkLobbyLayer
+    if lobby and lobby.handleWebSocketEvent then
+        lobby:handleWebSocketEvent(eventName, payload)
+        return
+    end
+    local selectLayer = _G.__networkSelectLayer
+    if selectLayer and selectLayer.handleWebSocketEvent then
+        selectLayer:handleWebSocketEvent(eventName, payload)
+        return
+    end
+    log('[WS] Event %s %s', eventName or '', payload or '')
+end
+
+function enterNetworkLobby()
+    log('Enter network lobby')
+    local scene = CCScene:create()
+    local lobbyLayer = NetworkLobbyLayer:create()
+    scene:addChild(lobbyLayer)
+    director.replaceSceneWithFade(scene, 1)
 end

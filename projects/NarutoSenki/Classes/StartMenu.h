@@ -1,10 +1,12 @@
 #pragma once
+#include <string>
 #include "SelectLayer.h"
 #include "CreditsLayer.h"
 #include "UI/GameModeLayer.h"
 #include "MyUtils/KTools.h"
 #include "MyUtils/CCStrokeLabel.h"
 #include "MyUtils/CCScrewLayer.h"
+#include "GUI/CCEditBox/CCEditBox.h"
 
 // declare menuButton
 enum class MenuButtonType
@@ -45,7 +47,7 @@ protected:
 	inline bool containsTouchLocation(Touch *touch);
 };
 
-class StartMenu : public Layer
+class StartMenu : public Layer, public cocos2d::extension::CCEditBoxDelegate
 {
 public:
 	StartMenu();
@@ -53,6 +55,7 @@ public:
 	bool init();
 
 	void onTrainingCallBack();
+	void onCustomCallBack();
 	void onHardCoreOn(Ref *sender);
 	void onHardCoreOff(Ref *sender);
 	void onHardLayerCallBack();
@@ -66,6 +69,18 @@ public:
 
 	void onNewsBtn(Ref *sender);
 	void onLoginBtn(Ref *sender);
+	void onProfileBtn(Ref *sender);
+	void onLoginLayerClose(Ref *sender);
+	void onLoginLayerSubmit(Ref *sender);
+	void onProfileLayerClose(Ref *sender);
+	void onProfileLogout(Ref *sender);
+	void rebuildLoginAccountMenu();
+	void updateLoginFieldHighlight(bool userActive);
+
+	void editBoxEditingDidBegin(cocos2d::extension::CCEditBox *editBox);
+	void editBoxEditingDidEnd(cocos2d::extension::CCEditBox *editBox);
+	void editBoxTextChanged(cocos2d::extension::CCEditBox *editBox, const std::string &text);
+	void editBoxReturn(cocos2d::extension::CCEditBox *editBox);
 
 	void scrollMenu(int posY);
 	Sprite *menuText;
@@ -76,6 +91,13 @@ public:
 	bool isDrag;
 
 	MenuItem *login_btn;
+	Menu *loginAccountMenu;
+	Layer *loginLayer;
+	Layer *profileLayer;
+	cocos2d::extension::CCEditBox *loginUserEdit;
+	cocos2d::extension::CCEditBox *loginPwEdit;
+	Sprite *loginUserFieldBg;
+	Sprite *loginPwFieldBg;
 	void setNotice();
 
 	Layer *notice_layer;
@@ -97,4 +119,5 @@ private:
 	void onExit();
 
 	vector<MenuButton *> _menuArray;
+	static std::string trimmedUserDefaultString(const char *key);
 };

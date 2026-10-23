@@ -114,6 +114,7 @@ public:
 
 
 	HPBar*				_hpBar;
+	CCLabelBMFont*		_networkNicknameLabel;
 	Sprite*				_shadow;
 	float				_originY;
 	float				_backY;
@@ -267,6 +268,8 @@ public:
 
 	void				update(float dt);
 	void				updateHpBarPosition(float dt);
+	void				tryCreateNetworkBattleNicknameLabel();
+	void				syncNetworkNicknameLabelLayout();
 	void				acceptAttack(Ref* object);
 
 	float				getHpPercent();
@@ -281,6 +284,7 @@ public:
 	void				oAttack(ABType type);
 	bool				hurt();
 	bool				hardHurt(int delayTime, bool isHurtAction, bool isCatch, bool isStick, bool isStun);
+	void				sendOnlineKnockSnapToPeer(float dt);
 	// bool				hardHurt(int delayTime, bool isHurtAction, HardHurtState state);
 	void				absorb(Vec2 position, bool isImmediate);
 	void				jump() {}; // No reference
@@ -503,6 +507,8 @@ public:
 		if (isUpdateHpBar)
 			updateHpBar();
 	}
+	/** WS battle_stat: mirror peer HP; at 0 call dead() (not loseHP — no local kill economy). */
+	void applyPeerMirrorHpFromNetwork(uint32_t uhp);
 	void setMaxHPValue(uint32_t var, bool isUpdateHpBar = true) {
 		setMaxHP(var);
 		if (isUpdateHpBar)

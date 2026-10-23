@@ -67,6 +67,18 @@ do {    \
 //USING_NS_CC;
 static EAGLView *view;
 
+static void SyncCocosFrameFromNSView(NSView *nsView)
+{
+	if (!nsView)
+		return;
+	NSRect b = [nsView bounds];
+	cocos2d::CCEGLView *eglView = cocos2d::CCEGLView::sharedOpenGLView();
+	if (eglView)
+	{
+		eglView->handleScreenResize((float)b.size.width, (float)b.size.height);
+	}
+}
+
 @implementation EAGLView
 
 @synthesize eventDelegate = eventDelegate_, isFullScreen = isFullScreen_, frameZoomFactor=frameZoomFactor_;
@@ -220,9 +232,14 @@ static EAGLView *view;
 	// Add a mutex around to avoid the threads accessing the context simultaneously when resizing
 
 	[self lockOpenGLContext];
-	
-//	NSRect rect = [self bounds];
-	
+
+	NSRect rect = [self bounds];
+	cocos2d::CCEGLView *eglView = cocos2d::CCEGLView::sharedOpenGLView();
+	if (eglView)
+	{
+		eglView->handleScreenResize(rect.size.width, rect.size.height);
+	}
+
 	cocos2d::CCDirector *director = cocos2d::CCDirector::sharedDirector();
 //	CGSize size = NSSizeToCGSize(rect.size);
 //	cocos2d::CCSize ccsize = cocos2d::CCSizeMake(size.width, size.height);
@@ -303,8 +320,11 @@ static EAGLView *view;
         superViewGLView_ = [[openGLview superview] retain];
 
 
-        // Get screen size
-        NSRect displayRect = [[NSScreen mainScreen] frame];
+        // Cover the screen that hosts the game window (correct monitor + aspect sync).
+        NSScreen *screen = [[openGLview window] screen];
+        if (!screen)
+            screen = [NSScreen mainScreen];
+        NSRect displayRect = [screen frame];
 
         // Create a screen-sized window on the display you want to take over
         fullScreenWindow_ = [[CCWindow alloc] initWithFrame:displayRect fullscreen:YES];
@@ -322,6 +342,8 @@ static EAGLView *view;
         [fullScreenWindow_ makeKeyAndOrderFront:self];
 		[fullScreenWindow_ makeMainWindow];
 		//[fullScreenWindow_ setNextResponder:superViewGLView_];
+
+        SyncCocosFrameFromNSView(openGLview);
 
     } else {
 
@@ -341,10 +363,15 @@ static EAGLView *view;
         // Show the window
         [windowGLView_ makeKeyAndOrderFront:self];
 		[windowGLView_ makeMainWindow];
+
+        SyncCocosFrameFromNSView(openGLview);
     }
 	
 	// issue #1189
-	[windowGLView_ makeFirstResponder:openGLview];
+	if (fullscreen)
+		[fullScreenWindow_ makeFirstResponder:openGLview];
+	else
+		[windowGLView_ makeFirstResponder:openGLview];
 
     isFullScreen_ = fullscreen;
 
@@ -568,6 +595,48 @@ id obj = eventDelegate_;																		\
     #if CC_USE_IMGUI > 0
         ImGui_ImplOSX_HandleEvent(theEvent, self);
     #endif // #if CC_USE_IMGUI > 0
+
+	// macOS: unlike iOS, there is no -insertText: path into CCIMEDispatcher.
+	// Forward key events so CCTextFieldTTF (IME delegate) can receive typed text.
+	{
+		BOOL skipCharInsert = NO;
+		if (([theEvent modifierFlags] & NSCommandKeyMask) != 0)
+		{
+			NSString *ign = [theEvent charactersIgnoringModifiers];
+			if ([ign length] == 1)
+			{
+				unichar u = [ign characterAtIndex:0];
+				if (u == 'a' || u == 'A')
+				{
+					cocos2d::CCIMEDispatcher::sharedDispatcher()->dispatchSelectAll();
+					skipCharInsert = YES;
+				}
+			}
+		}
+
+		if (!skipCharInsert)
+		{
+			const int keyCode = (int)[theEvent keyCode];
+			// 51 = backspace, 117 = forward delete (typical US keyboard layout)
+			if (keyCode == 51 || keyCode == 117)
+			{
+				cocos2d::CCIMEDispatcher::sharedDispatcher()->dispatchDeleteBackward();
+			}
+			else
+			{
+				NSString *chars = [theEvent characters];
+				if ([chars length] > 0)
+				{
+					const char *utf8 = [chars UTF8String];
+					const int len = (int)strlen(utf8);
+					if (len > 0)
+					{
+						cocos2d::CCIMEDispatcher::sharedDispatcher()->dispatchInsertText(utf8, len);
+					}
+				}
+			}
+		}
+	}
     
 	// pass the event along to the next responder (like your NSWindow subclass)
 	[super keyDown:theEvent];
